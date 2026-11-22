@@ -128,6 +128,10 @@ class Compose(unittest.TestCase):
         with self.assertRaisesRegex(boot.Refused, 'init='):
             compose(args=NIXOS_ARGS + ['init=/bin/sh'])
 
+    def test_relative_init_refused(self):
+        with self.assertRaisesRegex(boot.Refused, 'absolute Nix store path'):
+            compose(init='boot-artifacts/init')
+
     def test_recompose_is_stable(self):
         first, _ = compose()
         self.assertEqual(compose(current=first)[0], first)

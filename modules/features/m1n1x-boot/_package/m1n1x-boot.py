@@ -218,6 +218,7 @@ def check_firmware(firmware):
 
 def bootargs_line(args, init):
     require(not any(arg.startswith('init=') for arg in args), 'Kernel parameters already set init=')
+    require(init.startswith(STORE), 'init must be an absolute Nix store path')
     unique = list(dict.fromkeys(args))
     line = BOOTARGS + ' '.join(unique + ['init=' + init]).encode() + b'\n'
     require(len(line) - len(BOOTARGS) - 1 <= MAX_BOOTARGS,
