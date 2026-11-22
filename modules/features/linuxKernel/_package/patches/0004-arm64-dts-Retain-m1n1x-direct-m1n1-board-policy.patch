@@ -1,0 +1,435 @@
+From: Dilshad <a-rustacean@outlook.com>
+Date: Sat, 21 Nov 2026 12:00:00 +0000
+Subject: [PATCH] arm64 dts Retain direct m1n1 board policy
+
+Retain the downstream fixes and policy from commit 9b58444 on
+GravityLinux/linux c7e7b86aed0c4c052851e5c3b2c02088c0602f02.
+Hardware drivers and board enablement are supplied by Gravity, not
+re-exported here. Original authorship and sign-offs remain in that
+commit and the source files; this rebased integration has no new DCO
+sign-off and is not an upstream submission. See docs/SOURCES.md.
+
+---
+diff --git a/arch/arm64/boot/dts/apple/t8132-m1n1x.dtsi b/arch/arm64/boot/dts/apple/t8132-m1n1x.dtsi
+new file mode 100644
+index 0000000..0186ac3
+--- /dev/null
++++ b/arch/arm64/boot/dts/apple/t8132-m1n1x.dtsi
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: GPL-2.0+ OR MIT
++/* m1n1x's direct-m1n1 boot policy, shared by J713 and J773G only. */
++/ {
++	aliases {
++		/delete-property/ dcpext0;
++		/delete-property/ dcpext1;
++		/delete-property/ dispext0_piodma;
++		/delete-property/ dispext1_piodma;
++	};
++};
++
++/* m1n1 enables these only after supplying their reserved firmware state. */
++&gpu { status = "disabled"; };
++&pmp { status = "disabled"; };
++&pmp_mbox {
++	compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
++};
++&framebuffer0 { /delete-property/ post-init-providers; };
++
++&dcpext0 { status = "disabled"; };
++&dcpext1 { status = "disabled"; };
++&display { iommus = <&disp0_dart 0>; };
++&dcp {
++	/delete-property/ power-domains;
++	/delete-property/ power-domain-names;
++};
++&ps_disp_cpu { status = "disabled"; };
++&ps_disp_fe { apple,always-on; };
++&ps_disp_sys { apple,always-on; };
++&admac { status = "disabled"; };
++&mca { status = "disabled"; };
++&dpaudio0 { status = "disabled"; };
++&dpaudio1 { status = "disabled"; };
++&dpaudio2 { status = "disabled"; };
++&{/soc/cio@401ac0000} { status = "disabled"; };
++&{/soc/cio@409ac0000} { status = "disabled"; };
+diff --git a/arch/arm64/boot/dts/apple/t8132-gpu.dtsi b/arch/arm64/boot/dts/apple/t8132-gpu.dtsi
+index a6702ec..c1dbb7b 100644
+--- a/arch/arm64/boot/dts/apple/t8132-gpu.dtsi
++++ b/arch/arm64/boot/dts/apple/t8132-gpu.dtsi
+@@ -38,6 +38,9 @@
+ 				<&uat_handoff>, <&gpu_firmware>;
+ 		memory-region-names = "ttbs", "pagetables", "l2",
+ 				      "handoff", "firmware";
++		#cooling-cells = <2>;
++		/* Filled in by the bootloader. */
++		apple,firmware-abi = <0 0 0>;
+ 		/* Enabled only after the loader has reserved the firmware state. */
+ 		status = "disabled";
+ 	};
+diff --git a/arch/arm64/boot/dts/apple/t8132-j713.dts b/arch/arm64/boot/dts/apple/t8132-j713.dts
+index 253c72d..7b85373 100644
+--- a/arch/arm64/boot/dts/apple/t8132-j713.dts
++++ b/arch/arm64/boot/dts/apple/t8132-j713.dts
+@@ -16,6 +16,7 @@
+ / {
+ 	compatible = "apple,j713", "apple,t8132", "apple,arm-platform";
+ 	model = "Apple MacBook Air (13-inch, M4, 2025)";
++	/delete-node/ thermal-zones;
+ 
+ 	sound {
+ 		compatible = "apple,j713-macaudio", "apple,macaudio";
+@@ -54,6 +55,111 @@
+ 			};
+ 		};
+ 	};
++
++	thermal-zones {
++		/*
++		 * PMP's fast die loop catches load steps, but under sustained
++		 * all-core load the hot spot keeps creeping up past it by about
++		 * 0.1 C a second. Hold it at 105 C, where macOS holds it, and
++		 * reset the controller once the CPUs have gone idle.
++		 */
++		cpu-thermal {
++			polling-delay-passive = <500>;
++			polling-delay = <500>;
++			thermal-sensors = <&smc_hwmon 4>;
++			sustainable-power = <17000>;
++
++			trips {
++				cpu-switch-on {
++					temperature = <65000>;
++					hysteresis = <0>;
++					type = "passive";
++				};
++
++				cpu_control: cpu-control {
++					temperature = <105000>;
++					hysteresis = <0>;
++					type = "passive";
++				};
++
++				cpu-critical {
++					temperature = <118000>;
++					hysteresis = <0>;
++					type = "critical";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					trip = <&cpu_control>;
++					cooling-device =
++						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
++			};
++		};
++
++		/*
++		 * Under sustained all-core load macOS lets TVS1 reach 45 C, then
++		 * holds it there at about 7.8 W. Near that power an E core does 1.6
++		 * times the work per watt of a P core, so the E cores get the larger
++		 * share. The GPU heats the same chassis and is weighted like the P
++		 * cores.
++		 */
++		chassis-thermal {
++			polling-delay-passive = <1000>;
++			polling-delay = <1000>;
++			thermal-sensors = <&smc_hwmon 7>;
++			sustainable-power = <7850>;
++
++			trips {
++				chassis-switch-on {
++					temperature = <42000>;
++					hysteresis = <0>;
++					type = "passive";
++				};
++
++				chassis_control: chassis-control {
++					temperature = <45000>;
++					hysteresis = <0>;
++					type = "passive";
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					trip = <&chassis_control>;
++					cooling-device =
++						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++						<&cpu_e4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++						<&cpu_e5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++					contribution = <2048>;
++				};
++
++				map1 {
++					trip = <&chassis_control>;
++					cooling-device =
++						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
++						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++					contribution = <1024>;
++				};
++
++				map2 {
++					trip = <&chassis_control>;
++					cooling-device =
++						<&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++					contribution = <1024>;
++				};
++			};
++		};
++	};
+ };
+ 
+ &dcp {
+@@ -197,6 +303,27 @@
+ #include "t8132-air-dp-altmode.dtsi"
+ 
+ &smc_hwmon {
++	/* Retain per-channel CPU/chassis thermal zones. */
++	#thermal-sensor-cells = <1>;
++	/delete-property/ apple,thermal-sensor-keys;
++	/delete-node/ temperature-Tp0W;
++	/delete-node/ temperature-Tp0Z;
++	/delete-node/ temperature-Tp0c;
++	/delete-node/ temperature-Tp3P;
++	/delete-node/ temperature-Tp3X;
++	/delete-node/ temperature-Tp0f;
++	temperature-TCMz {
++		apple,key-id = "TCMz";
++		label = "CPU Hot Spot";
++	};
++	temperature-Tp0f {
++		apple,key-id = "Tp0f";
++		label = "CPU Temperature";
++	};
++	power-PPbb {
++		apple,key-id = "PPbb";
++		label = "E-cluster Rail Power";
++	};
+ 	/* Slow SMC temperature estimates; physical sensor locations are unknown. */
+ 	temperature-TVS0 {
+ 		label = "Chassis Estimate TVS0";
+@@ -323,3 +450,69 @@
+ &ps_disp_sys {
+ 	/delete-property/ apple,always-on;
+ };
++
++/* m1n1x boots directly from m1n1, without a live U-Boot MTP session. */
++&mtp { /delete-property/ apple,live-handoff-capable; };
++&{/led-controller/led-0} { default-state = "off"; };
++&smc_gpio { apple,output-templates = <0x1c 0x10000>; };
++
++/* Unqualified camera, audio and external displays remain off. */
++&isp { status = "disabled"; };
++&isp_dart0 { status = "disabled"; };
++&isp_dart1 { status = "disabled"; };
++&isp_dart2 { status = "disabled"; };
++&pmp_report_isp { status = "disabled"; };
++&ps_isp_sys { status = "disabled"; };
++&ps_ispsens0 { status = "disabled"; };
++&ps_ispsens1 { status = "disabled"; };
++&ps_isp_cpu { status = "disabled"; };
++&ps_isp_cpu_core0 { status = "disabled"; };
++&ps_isp_cpu_core1 { status = "disabled"; };
++&ps_isp_fe { status = "disabled"; };
++&ps_isp_dprx { status = "disabled"; };
++&ps_isp_secure { status = "disabled"; };
++&ps_isp_sts0 { status = "disabled"; };
++&ps_isp_sts1 { status = "disabled"; };
++&ps_isp_pearl { status = "disabled"; };
++&ps_isp_be { status = "disabled"; };
++&ps_isp_clr { status = "disabled"; };
++&ps_isp_cvd { status = "disabled"; };
++&ps_isp_cvm { status = "disabled"; };
++&{/sound} { status = "disabled"; };
++&aop { status = "disabled"; };
++
++#include "t8132-m1n1x.dtsi"
++
++/* J713 measurements retained for power_allocator's CPU energy model. */
++&donan_e_opp {
++	opp01 { opp-microwatt = <65405>; };
++	opp02 { opp-microwatt = <85052>; };
++	opp03 { opp-microwatt = <141720>; };
++	opp04 { opp-microwatt = <219231>; };
++	opp05 { opp-microwatt = <302610>; };
++	opp06 { opp-microwatt = <412140>; };
++	opp07 { opp-microwatt = <542917>; };
++	opp08 { opp-microwatt = <582776>; };
++};
++&donan_p_opp {
++	opp01 { opp-microwatt = <294629>; };
++	opp02 { opp-microwatt = <457307>; };
++	opp03 { opp-microwatt = <604500>; };
++	opp04 { opp-microwatt = <810240>; };
++	opp05 { opp-microwatt = <1063248>; };
++	opp06 { opp-microwatt = <1343155>; };
++	opp07 { opp-microwatt = <1674960>; };
++	opp08 { opp-microwatt = <2045448>; };
++	opp09 { opp-microwatt = <2430199>; };
++	opp10 { opp-microwatt = <2817530>; };
++	opp11 { opp-microwatt = <3169036>; };
++	opp12 { opp-microwatt = <3523151>; };
++	opp13 { opp-microwatt = <3844547>; };
++	opp14 { opp-microwatt = <4154686>; };
++	opp15 { opp-microwatt = <4316348>; };
++	opp16 { opp-microwatt = <4448904>; };
++	opp17 { opp-microwatt = <4618690>; };
++	opp18 { opp-microwatt = <4793086>; };
++	opp19 { opp-microwatt = <5776890>; };
++	opp20 { opp-microwatt = <5940083>; };
++};
+diff --git a/arch/arm64/boot/dts/apple/t8132-j773g.dts b/arch/arm64/boot/dts/apple/t8132-j773g.dts
+index 2de3531..ada5317 100644
+--- a/arch/arm64/boot/dts/apple/t8132-j773g.dts
++++ b/arch/arm64/boot/dts/apple/t8132-j773g.dts
+@@ -474,3 +474,12 @@
+ &ps_disp_sys {
+ 	/delete-property/ apple,always-on;
+ };
++
++/* A fixed hub is not a role-switched Type-C connection. */
++&dwc3_2 { /delete-property/ usb-role-switch; };
++&{/speaker-audio} { status = "disabled"; };
++&{/soc/display-port-1} { status = "disabled"; };
++&{/soc/display-port-3} { status = "disabled"; };
++&{/soc/cio@419ac0000} { status = "disabled"; };
++
++#include "t8132-m1n1x.dtsi"
+diff --git a/arch/arm64/boot/dts/apple/t8132.dtsi b/arch/arm64/boot/dts/apple/t8132.dtsi
+index e021644..8edc163 100644
+--- a/arch/arm64/boot/dts/apple/t8132.dtsi
++++ b/arch/arm64/boot/dts/apple/t8132.dtsi
+@@ -15,6 +15,9 @@
+ / {
+ 	compatible = "apple,t8132", "apple,arm-platform";
+ 
++	/* The cores report CLIDR_EL1.LoC == 0: no DMA needs cache maintenance. */
++	dma-coherent;
++
+ 	#address-cells = <2>;
+ 	#size-cells = <2>;
+ 
+@@ -77,6 +80,7 @@
+ 			d-cache-size = <0x10000>;
+ 			operating-points-v2 = <&donan_e_opp>;
+ 			performance-domains = <&cpufreq_e>;
++			#cooling-cells = <2>;
+ 		};
+ 
+ 		cpu_e1: cpu@1 {
+@@ -91,6 +95,7 @@
+ 			d-cache-size = <0x10000>;
+ 			operating-points-v2 = <&donan_e_opp>;
+ 			performance-domains = <&cpufreq_e>;
++			#cooling-cells = <2>;
+ 		};
+ 
+ 		cpu_e2: cpu@2 {
+@@ -105,6 +110,7 @@
+ 			d-cache-size = <0x10000>;
+ 			operating-points-v2 = <&donan_e_opp>;
+ 			performance-domains = <&cpufreq_e>;
++			#cooling-cells = <2>;
+ 		};
+ 
+ 		cpu_e3: cpu@3 {
+@@ -119,6 +125,7 @@
+ 			d-cache-size = <0x10000>;
+ 			operating-points-v2 = <&donan_e_opp>;
+ 			performance-domains = <&cpufreq_e>;
++			#cooling-cells = <2>;
+ 		};
+ 
+ 		cpu_e4: cpu@4 {
+@@ -133,6 +140,7 @@
+ 			d-cache-size = <0x10000>;
+ 			operating-points-v2 = <&donan_e_opp>;
+ 			performance-domains = <&cpufreq_e>;
++			#cooling-cells = <2>;
+ 		};
+ 
+ 		cpu_e5: cpu@5 {
+@@ -147,6 +155,7 @@
+ 			d-cache-size = <0x10000>;
+ 			operating-points-v2 = <&donan_e_opp>;
+ 			performance-domains = <&cpufreq_e>;
++			#cooling-cells = <2>;
+ 		};
+ 
+ 		cpu_p0: cpu@10100 {
+@@ -161,6 +170,7 @@
+ 			d-cache-size = <0x20000>;
+ 			operating-points-v2 = <&donan_p_opp>;
+ 			performance-domains = <&cpufreq_p>;
++			#cooling-cells = <2>;
+ 		};
+ 
+ 		cpu_p1: cpu@10101 {
+@@ -175,6 +185,7 @@
+ 			d-cache-size = <0x20000>;
+ 			operating-points-v2 = <&donan_p_opp>;
+ 			performance-domains = <&cpufreq_p>;
++			#cooling-cells = <2>;
+ 		};
+ 
+ 		cpu_p2: cpu@10102 {
+@@ -189,6 +200,7 @@
+ 			d-cache-size = <0x20000>;
+ 			operating-points-v2 = <&donan_p_opp>;
+ 			performance-domains = <&cpufreq_p>;
++			#cooling-cells = <2>;
+ 		};
+ 
+ 		cpu_p3: cpu@10103 {
+@@ -203,6 +215,7 @@
+ 			d-cache-size = <0x20000>;
+ 			operating-points-v2 = <&donan_p_opp>;
+ 			performance-domains = <&cpufreq_p>;
++			#cooling-cells = <2>;
+ 		};
+ 
+ 		l2_cache_0: l2-cache-0 {
+@@ -310,6 +323,18 @@
+ 		clock-output-names = "dispext1";
+ 	};
+ 
++	pmu-e {
++		compatible = "apple,donan-e-pmu";
++		interrupt-parent = <&aic>;
++		interrupts = <AIC_FIQ AIC_CPU_PMU_E IRQ_TYPE_LEVEL_HIGH>;
++	};
++
++	pmu-p {
++		compatible = "apple,donan-p-pmu";
++		interrupt-parent = <&aic>;
++		interrupts = <AIC_FIQ AIC_CPU_PMU_P IRQ_TYPE_LEVEL_HIGH>;
++	};
++
+ 	soc: soc {
+ 		compatible = "simple-bus";
+ 		#address-cells = <2>;
+@@ -324,12 +349,14 @@
+ 			compatible = "apple,t8132-cluster-cpufreq", "apple,t8112-cluster-cpufreq";
+ 			reg = <0x2 0x10e20000 0x0 0x1000>;
+ 			#performance-domain-cells = <0>;
++			apple,fast-die-effort = <&pmp_report 0>;
+ 		};
+ 
+ 		cpufreq_p: cpufreq@211e20000 {
+ 			compatible = "apple,t8132-cluster-cpufreq", "apple,t8112-cluster-cpufreq";
+ 			reg = <0x2 0x11e20000 0x0 0x1000>;
+ 			#performance-domain-cells = <0>;
++			apple,fast-die-effort = <&pmp_report 1>;
+ 		};
+ 
+ 		disp0_dart: iommu@30a300000 {

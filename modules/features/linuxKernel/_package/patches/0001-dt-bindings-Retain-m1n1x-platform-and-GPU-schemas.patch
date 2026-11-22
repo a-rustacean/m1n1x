@@ -1,0 +1,440 @@
+From: Dilshad <a-rustacean@outlook.com>
+Date: Sat, 21 Nov 2026 12:00:00 +0000
+Subject: [PATCH] dt bindings Retain m1n1x platform and GPU schemas
+
+Retain the downstream fixes and policy from commit 9b58444 on
+GravityLinux/linux c7e7b86aed0c4c052851e5c3b2c02088c0602f02.
+Hardware drivers and board enablement are supplied by Gravity, not
+re-exported here. Original authorship and sign-offs remain in that
+commit and the source files; this rebased integration has no new DCO
+sign-off and is not an upstream submission. See docs/SOURCES.md.
+
+---
+diff --git a/Documentation/devicetree/bindings/arm/pmu.yaml b/Documentation/devicetree/bindings/arm/pmu.yaml
+index f47baae..c27f06e 100644
+--- a/Documentation/devicetree/bindings/arm/pmu.yaml
++++ b/Documentation/devicetree/bindings/arm/pmu.yaml
+@@ -22,8 +22,16 @@ properties:
+           - apm,potenza-pmu
+           - apple,avalanche-pmu
+           - apple,blizzard-pmu
++          - apple,brava-e-pmu
++          - apple,brava-p-pmu
++          - apple,donan-e-pmu
++          - apple,donan-p-pmu
++          - apple,everest-pmu
+           - apple,firestorm-pmu
+           - apple,icestorm-pmu
++          - apple,sawtooth-pmu
++          - apple,tahiti-e-pmu
++          - apple,tahiti-p-pmu
+           - arm,armv8-pmuv3 # Only for s/w models
+           - arm,arm1136-pmu
+           - arm,arm1176-pmu
+diff --git a/Documentation/devicetree/bindings/cpufreq/apple,cluster-cpufreq.yaml b/Documentation/devicetree/bindings/cpufreq/apple,cluster-cpufreq.yaml
+index e8546a6..4b6fcbf 100644
+--- a/Documentation/devicetree/bindings/cpufreq/apple,cluster-cpufreq.yaml
++++ b/Documentation/devicetree/bindings/cpufreq/apple,cluster-cpufreq.yaml
+@@ -48,6 +48,16 @@ properties:
+   '#performance-domain-cells':
+     const: 0
+ 
++  apple,fast-die-effort:
++    $ref: /schemas/types.yaml#/definitions/phandle-array
++    description: |
++      PMP report publishing the fast die-temperature effort, and this
++      cluster's lane in it. The effort limits the cluster's maximum frequency.
++    items:
++      - items:
++          - description: PMP report
++          - description: Cluster lane (0 for E, 1 for P on T8132)
++
+ required:
+   - compatible
+   - reg
+diff --git a/Documentation/devicetree/bindings/gpio/apple,smc-gpio.yaml b/Documentation/devicetree/bindings/gpio/apple,smc-gpio.yaml
+index b4063a9..60af647 100644
+--- a/Documentation/devicetree/bindings/gpio/apple,smc-gpio.yaml
++++ b/Documentation/devicetree/bindings/gpio/apple,smc-gpio.yaml
+@@ -23,6 +23,18 @@ properties:
+   '#gpio-cells':
+     const: 2
+ 
++  apple,output-templates:
++    description:
++      Lines that the SMC sets through a function value rather than its output
++      command, as some resets need. Setting such a line writes its template
++      with the line's value in the low 16 bits.
++    $ref: /schemas/types.yaml#/definitions/uint32-matrix
++    items:
++      items:
++        - description: GPIO line
++          maximum: 63
++        - description: Template, with the low 16 bits clear
++
+ required:
+   - compatible
+   - gpio-controller
+diff --git a/Documentation/devicetree/bindings/gpu/apple,agx.yaml b/Documentation/devicetree/bindings/gpu/apple,agx.yaml
+index 3383f5a..532424d 100644
+--- a/Documentation/devicetree/bindings/gpu/apple,agx.yaml
++++ b/Documentation/devicetree/bindings/gpu/apple,agx.yaml
+@@ -17,6 +17,7 @@ properties:
+           - apple,agx-g13s
+           - apple,agx-g14g
+           - apple,agx-g14s
++          - apple,agx-t8132
+       - items:
+           - enum:
+               - apple,agx-g13c
+@@ -58,24 +59,15 @@ properties:
+     maxItems: 1
+ 
+   memory-region:
+-    items:
+-      - description: Region containing GPU MMU TTBs
+-      - description: Region containing GPU MMU page tables
+-      - description:
+-          Region containing a shared handoff structure for VM
+-          management coordination
+-      - description: Calibration blob. Mostly power-related configuration
+-      - description: Calibration blob. Mostly GPU-related configuration
+-      - description: Shared global variables with GPU firmware
++    minItems: 5
++    maxItems: 6
+ 
+   memory-region-names:
+-    items:
+-      - const: ttbs
+-      - const: pagetables
+-      - const: handoff
+-      - const: hw-cal-a
+-      - const: hw-cal-b
+-      - const: globals
++    minItems: 5
++    maxItems: 6
++
++  "#cooling-cells":
++    const: 2
+ 
+   apple,firmware-abi:
+     $ref: /schemas/types.yaml#/definitions/uint32-array
+@@ -92,6 +84,52 @@ required:
+   - memory-region
+   - apple,firmware-abi
+ 
++allOf:
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: apple,agx-t8132
++    then:
++      properties:
++        memory-region:
++          items:
++            - description: Region containing GPU MMU TTBs
++            - description: Region containing GPU MMU page tables
++            - description: Region containing the GPU MMU's level 2 tables
++            - description:
++                Region containing a shared handoff structure for VM
++                management coordination
++            - description: Region containing the GPU firmware, loaded by iBoot
++        memory-region-names:
++          items:
++            - const: ttbs
++            - const: pagetables
++            - const: l2
++            - const: handoff
++            - const: firmware
++    else:
++      properties:
++        memory-region:
++          items:
++            - description: Region containing GPU MMU TTBs
++            - description: Region containing GPU MMU page tables
++            - description:
++                Region containing a shared handoff structure for VM
++                management coordination
++            - description: Calibration blob. Mostly power-related configuration
++            - description: Calibration blob. Mostly GPU-related configuration
++            - description: Shared global variables with GPU firmware
++        memory-region-names:
++          items:
++            - const: ttbs
++            - const: pagetables
++            - const: handoff
++            - const: hw-cal-a
++            - const: hw-cal-b
++            - const: globals
++        "#cooling-cells": false
++
+ additionalProperties: false
+ 
+ examples:
+@@ -110,4 +148,26 @@ examples:
+ 
+         apple,firmware-abi = <0 0 0>;
+     };
++
++  - |
++    soc {
++        #address-cells = <2>;
++        #size-cells = <2>;
++
++        gpu@302600000 {
++            compatible = "apple,agx-t8132";
++            reg = <0x3 0x02600000 0x0 0x88000>,
++                  <0x3 0x00000000 0x0 0x4000000>;
++            reg-names = "asc", "sgx";
++            mboxes = <&agx_mbox>;
++            power-domains = <&ps_gfx>;
++            memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_l2>,
++                            <&uat_handoff>, <&gpu_firmware>;
++            memory-region-names = "ttbs", "pagetables", "l2",
++                                  "handoff", "firmware";
++            #cooling-cells = <2>;
++
++            apple,firmware-abi = <0 0 0>;
++        };
++    };
+ ...
+diff --git a/Documentation/devicetree/bindings/hwmon/apple,smc-hwmon.yaml b/Documentation/devicetree/bindings/hwmon/apple,smc-hwmon.yaml
+index 1a4f95c..18e9897 100644
+--- a/Documentation/devicetree/bindings/hwmon/apple,smc-hwmon.yaml
++++ b/Documentation/devicetree/bindings/hwmon/apple,smc-hwmon.yaml
+@@ -41,7 +41,8 @@ properties:
+     const: apple,smc-hwmon
+ 
+   '#thermal-sensor-cells':
+-    const: 0
++    enum: [0, 1]
++    description: Zero for the named-key maximum, one for a hwmon channel index.
+ 
+   apple,thermal-sensor-keys:
+     $ref: /schemas/types.yaml#/definitions/string-array
+@@ -59,9 +60,23 @@ properties:
+       This fault control value does not replace individual hwmon readings.
+ 
+ dependencies:
+-  '#thermal-sensor-cells': ['apple,thermal-sensor-keys']
+   apple,thermal-sensor-keys: ['#thermal-sensor-cells']
+ 
++allOf:
++  - if:
++      required: ['#thermal-sensor-cells']
++      properties:
++        '#thermal-sensor-cells':
++          const: 0
++    then:
++      required: ['apple,thermal-sensor-keys']
++  - if:
++      required: ['apple,thermal-sensor-keys']
++    then:
++      properties:
++        '#thermal-sensor-cells':
++          const: 0
++
+ patternProperties:
+   "^current-[A-Za-z0-9]{4}$":
+     $ref: "#/$defs/sensor"
+diff --git a/Documentation/devicetree/bindings/iommu/apple,dart.yaml b/Documentation/devicetree/bindings/iommu/apple,dart.yaml
+index ab08d0d..b67a885 100644
+--- a/Documentation/devicetree/bindings/iommu/apple,dart.yaml
++++ b/Documentation/devicetree/bindings/iommu/apple,dart.yaml
+@@ -29,7 +29,9 @@ properties:
+           - apple,t8110-dart
+           - apple,t6000-dart
+       - items:
+-          - const: apple,t6020-dart
++          - enum:
++              - apple,t6020-dart
++              - apple,t8132-dart
+           - const: apple,t8110-dart
+ 
+   reg:
+diff --git a/Documentation/devicetree/bindings/mailbox/apple,mailbox.yaml b/Documentation/devicetree/bindings/mailbox/apple,mailbox.yaml
+index 1c57975..9267cd1 100644
+--- a/Documentation/devicetree/bindings/mailbox/apple,mailbox.yaml
++++ b/Documentation/devicetree/bindings/mailbox/apple,mailbox.yaml
+@@ -76,7 +76,23 @@ properties:
+     const: 0
+ 
+   power-domains:
+-    maxItems: 1
++    minItems: 1
++    maxItems: 2
++
++allOf:
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: apple,t8132-asc-mailbox
++    then:
++      properties:
++        power-domains:
++          maxItems: 2
++    else:
++      properties:
++        power-domains:
++          maxItems: 1
+ 
+ required:
+   - compatible
+diff --git a/Documentation/devicetree/bindings/nvmem/apple,spmi-nvmem.yaml b/Documentation/devicetree/bindings/nvmem/apple,spmi-nvmem.yaml
+index 4ca75ed..5142b50 100644
+--- a/Documentation/devicetree/bindings/nvmem/apple,spmi-nvmem.yaml
++++ b/Documentation/devicetree/bindings/nvmem/apple,spmi-nvmem.yaml
+@@ -18,6 +18,7 @@ properties:
+   compatible:
+     items:
+       - enum:
++          - apple,abbey-pmic
+           - apple,maverick-pmic
+           - apple,sera-pmic
+           - apple,stowe-pmic
+diff --git a/Documentation/devicetree/bindings/pci/apple,pcie.yaml b/Documentation/devicetree/bindings/pci/apple,pcie.yaml
+index cd685a9..bb97b53 100644
+--- a/Documentation/devicetree/bindings/pci/apple,pcie.yaml
++++ b/Documentation/devicetree/bindings/pci/apple,pcie.yaml
+@@ -85,9 +85,7 @@ properties:
+           - const: phy1
+           - const: phy2
+           - const: phy3
+-      - minItems: 9
+-        maxItems: 9
+-        items:
++      - items:
+           - const: config
+           - const: rc
+           - const: port0
+@@ -209,11 +207,11 @@ allOf:
+     then:
+       properties:
+         reg:
+-          minItems: 8
+-          maxItems: 8
++          minItems: 9
++          maxItems: 9
+         reg-names:
+-          minItems: 8
+-          maxItems: 8
++          minItems: 9
++          maxItems: 9
+         interrupts:
+           minItems: 3
+           maxItems: 3
+diff --git a/Documentation/devicetree/bindings/phy/apple,atcphy.yaml b/Documentation/devicetree/bindings/phy/apple,atcphy.yaml
+index 0acac7e..d2c932b 100644
+--- a/Documentation/devicetree/bindings/phy/apple,atcphy.yaml
++++ b/Documentation/devicetree/bindings/phy/apple,atcphy.yaml
+@@ -28,6 +28,22 @@ description: >
+ 
+ allOf:
+   - $ref: /schemas/usb/usb-switch.yaml#
++  - if:
++      required:
++        - apple,fixed-usb3
++    then:
++      properties:
++        mode-switch: false
++        orientation-switch: false
++    else:
++      required:
++        - mode-switch
++        - orientation-switch
++        - ports
++
++dependentRequired:
++  apple,fixed-lane-swap:
++    - apple,fixed-usb3
+ 
+ $defs:
+   apple,tunable:
+@@ -55,6 +71,10 @@ properties:
+               - apple,t8112-atcphy
+           - const: apple,t8103-atcphy
+       - const: apple,t8103-atcphy
++      - items:
++          - const: apple,t8132-atcphy
++          - const: apple,t8122-atcphy
++      - const: apple,t8122-atcphy
+ 
+   reg:
+     items:
+@@ -81,6 +101,18 @@ properties:
+   mode-switch: true
+   orientation-switch: true
+ 
++  apple,fixed-usb3:
++    type: boolean
++    description: |
++      The PHY connects to a permanently attached, host-only USB3 device,
++      rather than a reversible Type-C connector. Configure the USB3 lanes
++      without waiting for Type-C mode or orientation notifications.
++
++  apple,fixed-lane-swap:
++    type: boolean
++    description: |
++      The permanently attached USB3 device uses the swapped lane routing.
++
+   power-domains:
+     maxItems: 1
+ 
+@@ -157,10 +189,7 @@ required:
+   - reg-names
+   - "#phy-cells"
+   - "#reset-cells"
+-  - orientation-switch
+-  - mode-switch
+   - power-domains
+-  - ports
+ 
+ additionalProperties: false
+ 
+diff --git a/Documentation/devicetree/bindings/pinctrl/apple,pinctrl.yaml b/Documentation/devicetree/bindings/pinctrl/apple,pinctrl.yaml
+index 0f06ecd..494da4b 100644
+--- a/Documentation/devicetree/bindings/pinctrl/apple,pinctrl.yaml
++++ b/Documentation/devicetree/bindings/pinctrl/apple,pinctrl.yaml
+@@ -72,6 +72,11 @@ properties:
+     maxItems: 1
+ 
+ patternProperties:
++  '-hog(-[0-9]+)?$':
++    type: object
++    required:
++      - gpio-hog
++
+   '-pins$':
+     type: object
+     $ref: pinmux-node.yaml#
+diff --git a/Documentation/devicetree/bindings/usb/apple,dwc3.yaml b/Documentation/devicetree/bindings/usb/apple,dwc3.yaml
+index f49e1a0..7abe392 100644
+--- a/Documentation/devicetree/bindings/usb/apple,dwc3.yaml
++++ b/Documentation/devicetree/bindings/usb/apple,dwc3.yaml
+@@ -15,6 +15,16 @@ description:
+ 
+ allOf:
+   - $ref: snps,dwc3-common.yaml#
++  - if:
++      not:
++        properties:
++          dr_mode:
++            const: host
++        required:
++          - dr_mode
++    then:
++      required:
++        - usb-role-switch
+ 
+ properties:
+   compatible:
+@@ -58,7 +68,6 @@ required:
+   - iommus
+   - resets
+   - power-domains
+-  - usb-role-switch
+ 
+ unevaluatedProperties: false
+ 

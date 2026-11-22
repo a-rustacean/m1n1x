@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Youwes09 <yuvi.shen@outlook.com>
+Date: Wed, 28 Oct 2026 23:35:56 -0500
+Subject: [PATCH] kboot_gpu: Boot without the GPU when the T8132 handoff fails
+
+A board without a calibration entry gets its GPU node disabled, but any
+other failure in the T8132 handoff, such as performance tables that do
+not match the board's calibration or a missing memory region, still
+fails the whole boot and leaves m1n1 in the proxy.
+
+The handoff enables the GPU node last, so on failure it is still
+disabled. Log the failure and boot without the GPU instead.
+
+Signed-off-by: Youwes09 <yuvi.shen@outlook.com>
+---
+ src/kboot_gpu.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/kboot_gpu.c b/src/kboot_gpu.c
+index 4f130f5c..a4e2dad9 100644
+--- a/src/kboot_gpu.c
++++ b/src/kboot_gpu.c
+@@ -738,8 +738,12 @@ static int dt_set_gpu_t8132(void *dt)
+ 
+ int dt_set_gpu(void *dt)
+ {
+-    if (chip_id == T8132)
+-        return dt_set_gpu_t8132(dt);
++    if (chip_id == T8132) {
++        // The handoff enables the GPU node last, so on failure it stays disabled.
++        if (dt_set_gpu_t8132(dt))
++            printf("FDT: GPU: T8132 handoff failed; leaving the GPU disabled\n");
++        return 0;
++    }
+ 
+     bool has_cs_afr = false;
+     int (*calc_power)(u32 count, u32 table_count, const struct perf_state *core,

@@ -1,0 +1,75 @@
+# What m1n1x uses on either board, plus hardware it may plug in, built in or as
+# modules. Checked by checks.kernel-modules.
+
+# Platform
+apple_soc_cpufreq
+apple_wdt
+macsmc_hwmon
+macsmc_input
+macsmc_power
+macsmc_reboot
+nvme_apple
+pmp
+apple_pmp_report
+pwm_apple
+leds_pwm
+rtc_macsmc
+spmi_apple_controller
+
+# Keyboard and trackpad
+apple_dockchannel
+hid_apple
+hid_generic
+hid_magicmouse
+
+# Wi-Fi and Bluetooth
+bluetooth
+brcmfmac
+brcmfmac_wcc
+brcmutil
+cfg80211
+hci_bcm4377
+rfkill
+
+# GPU
+asahi_m4
+
+# USB-C and USB devices
+dwc3
+dwc3_apple
+phy_apple_atc
+sn201202x
+tps6598x_core
+xhci_plat_hcd
+cdc_ether
+cdc_ncm
+r8152
+uas
+usb_storage
+usbhid
+usbnet
+
+# Filesystems
+exfat
+fat
+fuse
+loop
+nls_cp437
+nls_iso8859_1
+nls_utf8
+vfat
+
+# Networking
+atlantic
+tg3
+ip6t_rpfilter
+ipt_rpfilter
+md4
+netconsole
+nf_conntrack
+nf_tables
+nft_compat
+tun
+wireguard
+xt_conntrack
+xt_pkttype

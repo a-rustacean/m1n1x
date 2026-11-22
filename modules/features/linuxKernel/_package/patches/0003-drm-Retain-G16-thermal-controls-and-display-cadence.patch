@@ -1,0 +1,1717 @@
+From: Dilshad <a-rustacean@outlook.com>
+Date: Sat, 21 Nov 2026 12:00:00 +0000
+Subject: [PATCH] drm Retain G16 thermal controls and display cadence
+
+Retain the downstream fixes and policy from commit 9b58444 on
+GravityLinux/linux c7e7b86aed0c4c052851e5c3b2c02088c0602f02.
+Hardware drivers and board enablement are supplied by Gravity, not
+re-exported here. Original authorship and sign-offs remain in that
+commit and the source files; this rebased integration has no new DCO
+sign-off and is not an upstream submission.
+
+---
+diff --git a/drivers/gpu/drm/apple/Makefile b/drivers/gpu/drm/apple/Makefile
+index 1ad6b7f..fec79c8 100644
+--- a/drivers/gpu/drm/apple/Makefile
++++ b/drivers/gpu/drm/apple/Makefile
+@@ -17,6 +17,7 @@ appledrm-y += iomfb_v26_6_t8140.o
+ appledrm-y += iomfb_v27_2_t8142.o
+ appledrm-y += epic/dpavservep.o
+ appledrm-y += plane.o
++appledrm-y += vblank.o
+ 
+ 
+ appledrm-$(CONFIG_TRACING) += trace.o
+diff --git a/drivers/gpu/drm/apple/apple_drv.c b/drivers/gpu/drm/apple/apple_drv.c
+index 7a1db3b..1365c1d 100644
+--- a/drivers/gpu/drm/apple/apple_drv.c
++++ b/drivers/gpu/drm/apple/apple_drv.c
+@@ -363,6 +363,9 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
+ 
+ 	if (crtc_state->active)
+ 		dcp_crtc_atomic_modeset(crtc, commit);
++
++	apple_crtc_vblank_reset(to_apple_crtc(crtc));
++	drm_crtc_vblank_on(crtc);
+ }
+ 
+ static void apple_crtc_atomic_disable(struct drm_crtc *crtc,
+@@ -376,6 +379,8 @@ static void apple_crtc_atomic_disable(struct drm_crtc *crtc,
+ 		dcp_poweroff(apple_crtc->dcp);
+ 	}
+ 
++	drm_crtc_vblank_off(crtc);
++
+ 	if (crtc->state->event && !crtc->state->active) {
+ 		spin_lock_irq(&crtc->dev->event_lock);
+ 		drm_crtc_send_vblank_event(crtc, crtc->state->event);
+@@ -392,8 +397,12 @@ static void apple_crtc_atomic_begin(struct drm_crtc *crtc,
+ 	unsigned long flags;
+ 
+ 	if (crtc->state->event) {
++		/* Keep vblanks counting until the event is sent. */
++		bool vblank_ref = drm_crtc_vblank_get(crtc) == 0;
++
+ 		spin_lock_irqsave(&crtc->dev->event_lock, flags);
+ 		apple_crtc->event = crtc->state->event;
++		apple_crtc->event_vblank_ref = vblank_ref;
+ 		spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+ 		crtc->state->event = NULL;
+ 	}
+@@ -401,6 +410,7 @@ static void apple_crtc_atomic_begin(struct drm_crtc *crtc,
+ 
+ static void apple_crtc_cleanup(struct drm_crtc *crtc)
+ {
++	hrtimer_cancel(&to_apple_crtc(crtc)->vblank_timer);
+ 	drm_crtc_cleanup(crtc);
+ 	kfree(to_apple_crtc(crtc));
+ }
+@@ -468,7 +478,9 @@ static const struct drm_crtc_funcs apple_crtc_funcs = {
+ 	.set_crc_source		= apple_crtc_set_crc_source,
+ 	.verify_crc_source	= apple_crtc_verify_crc_source,
+ 	.get_crc_sources	= apple_crtc_get_crc_sources,
+-
++	.enable_vblank		= apple_crtc_enable_vblank,
++	.disable_vblank		= apple_crtc_disable_vblank,
++	.get_vblank_timestamp	= apple_crtc_get_vblank_timestamp,
+ };
+ 
+ static const struct drm_mode_config_funcs apple_mode_config_funcs = {
+@@ -616,6 +628,9 @@ static int apple_probe_per_dcp(struct device *dev,
+ 	}
+ 
+ 	crtc = kzalloc(sizeof(*crtc), GFP_KERNEL);
++	if (!crtc)
++		return -ENOMEM;
++	apple_crtc_vblank_init(crtc);
+ 	ret = drm_crtc_init_with_planes(drm, &crtc->base, primary_plane,
+ 					NULL,
+ 					&apple_crtc_funcs, NULL);
+@@ -868,6 +883,10 @@ static int apple_drm_init(struct device *dev)
+ 	if (ret)
+ 		goto err_unbind;
+ 
++	ret = drm_vblank_init(&apple->drm, apple->drm.mode_config.num_crtc);
++	if (ret)
++		goto err_unbind;
++
+ 	drm_mode_config_reset(&apple->drm);
+ 
+ 	fb_size = fb_r.end - fb_r.start + 1;
+diff --git a/drivers/gpu/drm/apple/dcp-internal.h b/drivers/gpu/drm/apple/dcp-internal.h
+index e2e0347..cc52ad6 100644
+--- a/drivers/gpu/drm/apple/dcp-internal.h
++++ b/drivers/gpu/drm/apple/dcp-internal.h
+@@ -220,7 +220,6 @@ struct apple_dcp {
+ 
+ 	/* swap id of the last completed swap */
+ 	u32 last_swap_id;
+-	ktime_t swap_start;
+ 
+ 	/* Neo mode changes wait for the clear-frame callback to be ACKed. */
+ 	wait_queue_head_t swap_ack_wait;
+@@ -273,9 +272,6 @@ struct apple_dcp {
+ 
+ 	unsigned notch_height;
+ 
+-	/* Workqueue for sending vblank events when a dcp swap is not possible */
+-	struct work_struct vblank_wq;
+-
+ 	/* List of referenced drm_framebuffers which can be unreferenced
+ 	 * on the next successfully completed swap.
+ 	 */
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index c201910..4bbd859 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -86,104 +86,50 @@ static bool unstable_edid = true;
+ module_param(unstable_edid, bool, 0644);
+ MODULE_PARM_DESC(unstable_edid, "Enable unstable EDID retrival support");
+ 
+-/* copied and simplified from drm_vblank.c */
+-static void send_vblank_event(struct drm_device *dev,
+-		struct drm_pending_vblank_event *e,
+-		u64 seq, ktime_t now)
+-{
+-	struct timespec64 tv;
+-
+-	if (e->event.base.type != DRM_EVENT_FLIP_COMPLETE)
+-		return;
+-
+-	tv = ktime_to_timespec64(now);
+-	e->event.vbl.sequence = seq;
+-	/*
+-		* e->event is a user space structure, with hardcoded unsigned
+-		* 32-bit seconds/microseconds. This is safe as we always use
+-		* monotonic timestamps since linux-4.15
+-		*/
+-	e->event.vbl.tv_sec = tv.tv_sec;
+-	e->event.vbl.tv_usec = tv.tv_nsec / 1000;
+-
+-	/*
+-	 * Use the same timestamp for any associated fence signal to avoid
+-	 * mismatch in timestamps for vsync & fence events triggered by the
+-	 * same HW event. Frameworks like SurfaceFlinger in Android expects the
+-	 * retire-fence timestamp to match exactly with HW vsync as it uses it
+-	 * for its software vsync modeling.
+-	 */
+-	drm_send_event_timestamp_locked(dev, &e->base, now);
+-}
+-
+-/**
+- * dcp_crtc_send_page_flip_event - helper to send vblank event after pageflip
+- *
+- * Compensate for unknown slack between page flip and arrival of the
+- * swap_complete callback. Minimal observed duration on DCP with HDMI output
+- * was around 2.3 ms. If the fb swap was submitted closer to the expected
+- * swap_complete it gets a penalty of one frame duration. This is on the border
+- * of unreasonable considering that Apple advertises support for 240 Hz (frame
+- * duration of 4.167 ms).
+- * It is unreasonable considering kwin's kms commit scheduling. Kwin commits
+- * 1.5 ms + the mode's vblank time before the expected next page flip
+- * completion. This results in presenting at half the display's rate for HDMI
+- * outputs.
+- * This might be a difference between dcp and dcpext.
+- */
+-static void dcp_crtc_send_page_flip_event(struct apple_crtc *crtc,
+-					  struct drm_pending_vblank_event *e,
+-					  ktime_t now, ktime_t start)
+-{
+-	struct drm_device *dev = crtc->base.dev;
+-	u64 seq;
+-	unsigned int pipe = drm_crtc_index(&crtc->base);
+-	ktime_t flip;
+-
+-	seq = 0;
+-	if (start != KTIME_MIN) {
+-		s64 delta = ktime_us_delta(now, start);
+-		if (delta <= 500)
+-			flip = now;
+-		else if (delta >= 2500)
+-			flip = ktime_sub_us(now, 1000);
+-		else
+-			flip = ktime_sub_us(now, (delta - 500) / 2);
+-	} else {
+-		flip = now;
+-	}
+-	e->pipe = pipe;
+-	send_vblank_event(dev, e, seq, flip);
+-}
+-
+-/* HACK: moved here to avoid circular dependency between apple_drv and dcp */
++/* Send the pending event now, with the last vblank's count and time. */
+ void dcp_drm_crtc_vblank(struct apple_crtc *crtc)
+ {
+ 	unsigned long flags;
++	bool put = false;
+ 
+ 	spin_lock_irqsave(&crtc->base.dev->event_lock, flags);
+ 	if (crtc->event) {
+ 		drm_crtc_send_vblank_event(&crtc->base, crtc->event);
+ 		crtc->event = NULL;
++		put = crtc->event_vblank_ref;
++		crtc->event_vblank_ref = false;
+ 	}
+ 	spin_unlock_irqrestore(&crtc->base.dev->event_lock, flags);
++
++	if (put)
++		drm_crtc_vblank_put(&crtc->base);
+ }
+ 
+-void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now)
++/* Send the pending event at the next vblank, for a commit without a swap. */
++void dcp_drm_crtc_vblank_next(struct apple_crtc *crtc)
+ {
+ 	unsigned long flags;
+-	struct apple_crtc *crtc = dcp->crtc;
+ 
+ 	spin_lock_irqsave(&crtc->base.dev->event_lock, flags);
+-	if (crtc->event) {
+-		if (crtc->event->event.base.type == DRM_EVENT_FLIP_COMPLETE)
+-			dcp_crtc_send_page_flip_event(crtc, crtc->event, now, dcp->swap_start);
+-		else
+-			drm_crtc_send_vblank_event(&crtc->base, crtc->event);
++	if (crtc->event && crtc->event_vblank_ref) {
++		/* The event takes over the vblank reference. */
++		drm_crtc_arm_vblank_event(&crtc->base, crtc->event);
+ 		crtc->event = NULL;
+-		dcp->swap_start = KTIME_MIN;
++		crtc->event_vblank_ref = false;
+ 	}
+ 	spin_unlock_irqrestore(&crtc->base.dev->event_lock, flags);
++
++	dcp_drm_crtc_vblank(crtc);
++}
++
++/* A swap completed: its frame's vblank is now. */
++void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now)
++{
++	struct apple_crtc *crtc = dcp->crtc;
++
++	apple_crtc_vblank_completion(crtc, now);
++	drm_crtc_handle_vblank(&crtc->base);
++	dcp_drm_crtc_vblank(crtc);
+ }
+ 
+ void dcp_set_dimensions(struct apple_dcp *dcp)
+@@ -233,20 +179,6 @@ int dcp_set_crc(struct drm_crtc *crtc, bool enabled)
+ 	return 0;
+ }
+ 
+-/*
+- * Helper to send a DRM vblank event. We do not know how call swap_submit_dcp
+- * without surfaces. To avoid timeouts in drm_atomic_helper_wait_for_vblanks
+- * send a vblank event via a workqueue.
+- */
+-static void dcp_delayed_vblank(struct work_struct *work)
+-{
+-	struct apple_dcp *dcp;
+-
+-	dcp = container_of(work, struct apple_dcp, vblank_wq);
+-	mdelay(5);
+-	dcp_drm_crtc_vblank(dcp->crtc);
+-}
+-
+ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
+ {
+ 	struct apple_dcp *dcp = cookie;
+@@ -2035,7 +1967,6 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
+ 	// TDOD: mem_desc IDs start at 1, for simplicity just skip '0' entry
+ 	set_bit(0, dcp->memdesc_map);
+ 
+-	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
+ 	dcp->swapped_out_fbs =
+ 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
+ 
+@@ -2168,7 +2099,6 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
+ 		cancel_work_sync(&dcp->bl_register_wq);
+ 		cancel_work_sync(&dcp->bl_update_wq);
+ 	}
+-	cancel_work_sync(&dcp->vblank_wq);
+ 
+ 	devm_clk_put(dev, dcp->clk);
+ 	dcp->clk = NULL;
+diff --git a/drivers/gpu/drm/apple/dcp.h b/drivers/gpu/drm/apple/dcp.h
+index 048770d..e6093fa 100644
+--- a/drivers/gpu/drm/apple/dcp.h
++++ b/drivers/gpu/drm/apple/dcp.h
+@@ -4,6 +4,9 @@
+ #ifndef __APPLE_DCP_H__
+ #define __APPLE_DCP_H__
+ 
++#include <linux/hrtimer.h>
++#include <linux/spinlock.h>
++
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_encoder.h>
+ #include <drm/drm_fourcc.h>
+@@ -15,8 +18,25 @@
+ struct apple_crtc {
+ 	struct drm_crtc base;
+ 	struct drm_pending_vblank_event *event;
++	/* Whether @event holds a vblank reference. */
++	bool event_vblank_ref;
+ 	bool vsync_disabled;
+ 
++	/* Vblank timing, modelled from swap completions (vblank.c). */
++	spinlock_t vblank_lock;
++	struct hrtimer vblank_timer;
++	bool vblank_enabled;
++	/* Whether a completion has placed the grid. */
++	bool vblank_synced;
++	/* A vblank timestamp, and the grid's period in ns. */
++	ktime_t vblank_base;
++	u64 vblank_period;
++	/* Where the period measurement started, and frames since. */
++	ktime_t vblank_ref;
++	u64 vblank_ref_frames;
++	/* Swap completion minus its frame's vblank timestamp, in ns. */
++	s64 vblank_offset;
++
+ 	/* Reference to the DCP device owning this CRTC */
+ 	struct platform_device *dcp;
+ };
+@@ -44,6 +64,15 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit);
+ bool dcp_is_initialized(struct platform_device *pdev);
+ void apple_crtc_vblank(struct apple_crtc *apple);
+ void dcp_drm_crtc_vblank(struct apple_crtc *crtc);
++void dcp_drm_crtc_vblank_next(struct apple_crtc *crtc);
++
++void apple_crtc_vblank_init(struct apple_crtc *crtc);
++void apple_crtc_vblank_reset(struct apple_crtc *crtc);
++void apple_crtc_vblank_completion(struct apple_crtc *crtc, ktime_t now);
++int apple_crtc_enable_vblank(struct drm_crtc *crtc);
++void apple_crtc_disable_vblank(struct drm_crtc *crtc);
++bool apple_crtc_get_vblank_timestamp(struct drm_crtc *crtc, int *max_error,
++				     ktime_t *vblank_time, bool in_vblank_irq);
+ int dcp_get_modes(struct drm_connector *connector);
+ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
+ 				    const struct drm_display_mode *mode);
+diff --git a/drivers/gpu/drm/apple/iomfb.c b/drivers/gpu/drm/apple/iomfb.c
+index 31056b1..3c59113 100644
+--- a/drivers/gpu/drm/apple/iomfb.c
++++ b/drivers/gpu/drm/apple/iomfb.c
+@@ -590,10 +590,8 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
+ 			dev_err(dcp->dev, "unexpected busy command channel\n");
+ 			dcp->ch_cmd.warned_busy = true;
+ 		}
+-		/* HACK: issue a delayed vblank event to avoid timeouts in
+-		 * drm_atomic_helper_wait_for_vblanks().
+-		 */
+-		schedule_work(&dcp->vblank_wq);
++		/* Nothing will be swapped, so nothing completes the event. */
++		dcp_drm_crtc_vblank_next(dcp->crtc);
+ 		return;
+ 	} else if (dcp->ch_cmd.warned_busy) {
+ 		dcp->ch_cmd.warned_busy = false;
+diff --git a/drivers/gpu/drm/apple/iomfb_template.c b/drivers/gpu/drm/apple/iomfb_template.c
+index dfd9e33..9f37c12 100644
+--- a/drivers/gpu/drm/apple/iomfb_template.c
++++ b/drivers/gpu/drm/apple/iomfb_template.c
+@@ -1446,7 +1446,7 @@ static void dcpep_cb_hotplug_state(struct apple_dcp *dcp, u64 connected)
+ 		dcp->valid_mode = false;
+ 		/* after unplug swap will not complete until the next
+ 		 * set_digital_out_mode */
+-		schedule_work(&dcp->vblank_wq);
++		dcp_drm_crtc_vblank_next(dcp->crtc);
+ 	}
+ 
+ 	if (connector && connector->connected != !!connected) {
+@@ -1592,8 +1592,6 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
+ 		dcp_drm_crtc_vblank(dcp->crtc);
+ 		return;
+ 	}
+-	dcp->swap_start = ktime_get();
+-
+ 	while (!list_empty(&dcp->swapped_out_fbs)) {
+ 		struct dcp_fb_reference *entry;
+ 		entry = list_first_entry(&dcp->swapped_out_fbs,
+@@ -2191,7 +2189,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
+ 	if (!has_surface && !crtc_state->color_mgmt_changed) {
+ 		if (crtc_state->enable && crtc_state->active &&
+ 		    !crtc_state->planes_changed) {
+-			schedule_work(&dcp->vblank_wq);
++			dcp_drm_crtc_vblank_next(dcp->crtc);
+ 			return;
+ 		}
+ 
+diff --git a/drivers/gpu/drm/apple/vblank.c b/drivers/gpu/drm/apple/vblank.c
+new file mode 100644
+index 0000000..93f389d
+--- /dev/null
++++ b/drivers/gpu/drm/apple/vblank.c
+@@ -0,0 +1,226 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++/*
++ * Vblank timing for DCP.
++ *
++ * DCP raises no vblank interrupt the AP can see, but it completes each swap
++ * on the frame boundary: swaps submitted at any time complete on a grid of
++ * the frame period, within about 10 us. A swap must reach DCP about 2.4 ms
++ * before that completion to make the frame, and one that arrives later
++ * than about 2.35 ms makes it but completes up to 100 us late, so
++ * completions can be late but are never early.
++ *
++ * The grid is modelled from the completions: an early one moves it at
++ * once, a late one only by a sixteenth, and the period is measured over
++ * about ten seconds of them. A timer delivers vblanks between swaps.
++ * Timestamps are placed so that the next vblank start, as
++ * drm_crtc_next_vblank_start() computes it, is the latest time a swap
++ * still makes the next frame.
++ */
++
++#include <linux/hrtimer.h>
++#include <linux/ktime.h>
++#include <linux/math64.h>
++#include <linux/spinlock.h>
++
++#include <drm/drm_crtc.h>
++#include <drm/drm_vblank.h>
++
++#include "dcp.h"
++
++/* How long before its completion a swap must reach DCP, measured on J713. */
++#define DCP_SWAP_LEAD_NS (2400 * NSEC_PER_USEC)
++
++/* Completions at most this far off the grid only adjust it. */
++#define DCP_SYNC_WINDOW(period) ((period) / 4)
++
++/* Frames between period measurements: about ten seconds at 60 Hz. */
++#define DCP_PERIOD_FRAMES 600
++
++/* Off by more than this from the mode's period, a measurement is wrong. */
++#define DCP_PERIOD_TOLERANCE(period) ((period) / 200)
++
++static u64 mode_period(struct apple_crtc *crtc)
++{
++	return drm_crtc_vblank_crtc(&crtc->base)->framedur_ns;
++}
++
++/* Swap completion minus the vblank timestamp of its frame. */
++static s64 completion_offset(struct apple_crtc *crtc)
++{
++	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(&crtc->base);
++	const struct drm_display_mode *mode = &vblank->hwmode;
++	u64 blank;
++
++	if (!mode->crtc_vtotal)
++		return DCP_SWAP_LEAD_NS;
++
++	blank = div_u64((u64)vblank->framedur_ns *
++				(mode->crtc_vtotal - mode->crtc_vblank_start),
++			mode->crtc_vtotal);
++	return DCP_SWAP_LEAD_NS - blank;
++}
++
++/* The vblank timestamp at or before @t, or nearest to it if @nearest. */
++static ktime_t grid_point(struct apple_crtc *crtc, ktime_t t, bool nearest)
++{
++	s64 since = ktime_to_ns(ktime_sub(t, crtc->vblank_base));
++	s64 n;
++
++	if (nearest)
++		since += crtc->vblank_period / 2;
++	n = div64_s64(since, crtc->vblank_period);
++	if (since < 0 && n * (s64)crtc->vblank_period != since)
++		n--;
++	return ktime_add_ns(crtc->vblank_base, n * crtc->vblank_period);
++}
++
++static void reset_grid(struct apple_crtc *crtc, ktime_t base)
++{
++	crtc->vblank_base = base;
++	crtc->vblank_ref = base;
++	crtc->vblank_ref_frames = 0;
++}
++
++static enum hrtimer_restart vblank_timer_fn(struct hrtimer *timer)
++{
++	struct apple_crtc *crtc = container_of(timer, struct apple_crtc, vblank_timer);
++	unsigned long flags;
++	ktime_t next;
++
++	spin_lock_irqsave(&crtc->vblank_lock, flags);
++	if (!crtc->vblank_enabled) {
++		spin_unlock_irqrestore(&crtc->vblank_lock, flags);
++		return HRTIMER_NORESTART;
++	}
++	next = ktime_add_ns(grid_point(crtc, ktime_get(), false), crtc->vblank_period);
++	hrtimer_set_expires(timer, next);
++	spin_unlock_irqrestore(&crtc->vblank_lock, flags);
++
++	drm_crtc_handle_vblank(&crtc->base);
++	return HRTIMER_RESTART;
++}
++
++void apple_crtc_vblank_init(struct apple_crtc *crtc)
++{
++	spin_lock_init(&crtc->vblank_lock);
++	hrtimer_setup(&crtc->vblank_timer, vblank_timer_fn, CLOCK_MONOTONIC,
++		      HRTIMER_MODE_ABS);
++}
++
++/* Forget the grid, for a new mode. */
++void apple_crtc_vblank_reset(struct apple_crtc *crtc)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&crtc->vblank_lock, flags);
++	crtc->vblank_synced = false;
++	crtc->vblank_period = mode_period(crtc);
++	crtc->vblank_offset = completion_offset(crtc);
++	reset_grid(crtc, ktime_get());
++	spin_unlock_irqrestore(&crtc->vblank_lock, flags);
++}
++
++int apple_crtc_enable_vblank(struct drm_crtc *base)
++{
++	struct apple_crtc *crtc = to_apple_crtc(base);
++	unsigned long flags;
++	ktime_t next;
++
++	spin_lock_irqsave(&crtc->vblank_lock, flags);
++	if (!crtc->vblank_period) {
++		crtc->vblank_period = mode_period(crtc);
++		crtc->vblank_offset = completion_offset(crtc);
++		reset_grid(crtc, ktime_get());
++	}
++	if (!crtc->vblank_period) {
++		spin_unlock_irqrestore(&crtc->vblank_lock, flags);
++		return -EINVAL;
++	}
++	crtc->vblank_enabled = true;
++	next = ktime_add_ns(grid_point(crtc, ktime_get(), false), crtc->vblank_period);
++	spin_unlock_irqrestore(&crtc->vblank_lock, flags);
++
++	hrtimer_start(&crtc->vblank_timer, next, HRTIMER_MODE_ABS);
++	return 0;
++}
++
++void apple_crtc_disable_vblank(struct drm_crtc *base)
++{
++	struct apple_crtc *crtc = to_apple_crtc(base);
++	unsigned long flags;
++
++	/*
++	 * Called under the vblank core's locks, which the timer takes, so
++	 * it cannot wait for a running timer; that one stops by itself.
++	 */
++	spin_lock_irqsave(&crtc->vblank_lock, flags);
++	crtc->vblank_enabled = false;
++	spin_unlock_irqrestore(&crtc->vblank_lock, flags);
++	hrtimer_try_to_cancel(&crtc->vblank_timer);
++}
++
++bool apple_crtc_get_vblank_timestamp(struct drm_crtc *base, int *max_error,
++				     ktime_t *vblank_time, bool in_vblank_irq)
++{
++	struct apple_crtc *crtc = to_apple_crtc(base);
++	unsigned long flags;
++	bool ok;
++
++	spin_lock_irqsave(&crtc->vblank_lock, flags);
++	ok = crtc->vblank_period != 0;
++	/*
++	 * In a vblank, the timer or a completion may run slightly before the
++	 * grid has caught up with it, so take the nearest point.
++	 */
++	if (ok)
++		*vblank_time = grid_point(crtc, ktime_get(), in_vblank_irq);
++	spin_unlock_irqrestore(&crtc->vblank_lock, flags);
++
++	return ok;
++}
++
++/* Fit the grid to a swap completion at @now. */
++void apple_crtc_vblank_completion(struct apple_crtc *crtc, ktime_t now)
++{
++	ktime_t seen, expected;
++	unsigned long flags;
++	s64 error, frames;
++	u64 period;
++
++	spin_lock_irqsave(&crtc->vblank_lock, flags);
++	period = crtc->vblank_period;
++	if (!period) {
++		spin_unlock_irqrestore(&crtc->vblank_lock, flags);
++		return;
++	}
++
++	seen = ktime_sub_ns(now, crtc->vblank_offset);
++	expected = grid_point(crtc, seen, true);
++	error = ktime_to_ns(ktime_sub(seen, expected));
++
++	if (!crtc->vblank_synced || abs(error) > DCP_SYNC_WINDOW(period)) {
++		crtc->vblank_synced = true;
++		reset_grid(crtc, seen);
++		goto out;
++	}
++
++	frames = div64_s64(ktime_to_ns(ktime_sub(expected, crtc->vblank_base)) +
++				   period / 2, period);
++	crtc->vblank_base = ktime_add_ns(expected, error < 0 ? error : error / 16);
++	crtc->vblank_ref_frames += frames;
++
++	if (crtc->vblank_ref_frames >= DCP_PERIOD_FRAMES) {
++		u64 measured = div64_u64(ktime_to_ns(ktime_sub(crtc->vblank_base,
++							      crtc->vblank_ref)),
++					 crtc->vblank_ref_frames);
++		u64 nominal = mode_period(crtc);
++
++		if (nominal && abs((s64)measured - (s64)nominal) <=
++				       DCP_PERIOD_TOLERANCE(nominal))
++			crtc->vblank_period = measured;
++		crtc->vblank_ref = crtc->vblank_base;
++		crtc->vblank_ref_frames = 0;
++	}
++out:
++	spin_unlock_irqrestore(&crtc->vblank_lock, flags);
++}
+diff --git a/drivers/gpu/drm/asahi/asahi_m4.rs b/drivers/gpu/drm/asahi/asahi_m4.rs
+index a819867..359af23 100644
+--- a/drivers/gpu/drm/asahi/asahi_m4.rs
++++ b/drivers/gpu/drm/asahi/asahi_m4.rs
+@@ -8,7 +8,9 @@
+ mod float;
+ mod g16;
+ mod g16_alloc;
++mod g16_cadence;
+ mod g16_compute;
++mod g16_cooling;
+ mod g16_deferred;
+ mod g16_drain;
+ mod g16_drm;
+@@ -123,6 +125,10 @@ kernel::module_platform_driver! {
+     description: "Apple M4 GPU driver",
+     license: "GPL v2",
+     params: {
++        display_cadence: u32 {
++            default: 1,
++            description: "Publish the display's frame cadence, from render fence deadlines, to the firmware's performance control (0: off)",
++        },
+         fw_counter_start: u64 {
+             default: 0,
+             description: "Initial submission counters for firmware rollover qualification (normally 0)",
+diff --git a/drivers/gpu/drm/asahi/g16.rs b/drivers/gpu/drm/asahi/g16.rs
+index ea37e1e..c60dfe7 100644
+--- a/drivers/gpu/drm/asahi/g16.rs
++++ b/drivers/gpu/drm/asahi/g16.rs
+@@ -292,6 +292,16 @@ pub(crate) struct Bootstrap {
+     /// from the later of this and its publication.
+     progress: Option<kernel::time::Instant<kernel::time::Monotonic>>,
+     batch_works: usize,
++    /// Submissions started since boot, mirrored in region C.
++    submissions: u32,
++    /// The cooling device's state, and the performance-state cap last
++    /// written to region C.
++    pub(crate) cooling: kernel::sync::Arc<crate::g16_cooling::Cooling>,
++    applied_cap: u32,
++    /// Render fence deadlines, and the cadence last published from them:
++    /// phase and period in counter ticks.
++    pub(crate) cadence: kernel::sync::Arc<crate::g16_cadence::Cadence>,
++    published_cadence: Option<(u64, u64)>,
+     context_roots: [Option<crate::g16_vm::Roots>; 64],
+     context_users: [u32; 64],
+     render_support: kernel::sync::Arc<core::sync::atomic::AtomicU64>,
+@@ -849,6 +859,11 @@ impl Bootstrap {
+             ledger: KBox::new(render_runtime::Ledger::with_capacity(render_runtime::MAX_FLIGHTS)?, GFP_KERNEL)?,
+             progress: None,
+             batch_works: 0,
++            submissions: 0,
++            cooling: crate::g16_cooling::Cooling::new(&platform)?,
++            applied_cap: platform.max_pstate(),
++            cadence: crate::g16_cadence::Cadence::new()?,
++            published_cadence: None,
+             context_roots: [None; 64],
+             context_users: [0; 64],
+             render_support: kernel::sync::Arc::new(
+diff --git a/drivers/gpu/drm/asahi/g16_cadence.rs b/drivers/gpu/drm/asahi/g16_cadence.rs
+new file mode 100644
+index 0000000..c867e70
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16_cadence.rs
+@@ -0,0 +1,71 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++//! The display's frame cadence, for the firmware's performance control.
++//!
++//! A display commit that waits on a render fence gives it a deadline: the
++//! next vblank start. Deadlines a frame apart give the frame period. The
++//! driver publishes the latest deadline and the period to region C, in
++//! counter ticks, and control message 0x22 has the firmware reread them.
++//! With no deadlines coming, the last cadence stays, as macOS leaves it.
++
++use kernel::{
++    new_spinlock,
++    prelude::*,
++    sync::{Arc, SpinLock},
++    time::{Instant, Monotonic},
++};
++
++/// Gaps between deadlines that are one frame: 240 Hz to just under 59 Hz.
++const FRAME_NS: core::ops::RangeInclusive<i64> = 4_100_000..=17_000_000;
++
++/// Deadlines older than this no longer describe a display being driven.
++const STALE_NS: i64 = 500_000_000;
++
++struct Track {
++    /// The latest deadline.
++    deadline: Option<Instant<Monotonic>>,
++    /// The frame period in ns, from deadlines a frame apart; 0 until known.
++    period: i64,
++}
++
++#[pin_data]
++pub(crate) struct Cadence {
++    #[pin]
++    track: SpinLock<Track>,
++}
++
++impl Cadence {
++    pub(crate) fn new() -> Result<Arc<Self>> {
++        Arc::pin_init(
++            pin_init!(Self {
++                track <- new_spinlock!(Track { deadline: None, period: 0 }),
++            }),
++            GFP_KERNEL,
++        )
++    }
++
++    /// Note a fence deadline. Fences of one commit share theirs.
++    pub(crate) fn add_deadline(&self, deadline: Instant<Monotonic>) {
++        let mut track = self.track.lock();
++        if let Some(last) = track.deadline {
++            let gap = (deadline - last).as_nanos();
++            if gap <= 0 {
++                return;
++            }
++            if FRAME_NS.contains(&gap) {
++                track.period = gap;
++            }
++        }
++        track.deadline = Some(deadline);
++    }
++
++    /// The latest deadline and the frame period in ns, while deadlines come.
++    pub(crate) fn current(&self, now: Instant<Monotonic>) -> Option<(Instant<Monotonic>, i64)> {
++        let track = self.track.lock();
++        let deadline = track.deadline?;
++        if track.period == 0 || (now - deadline).as_nanos() > STALE_NS {
++            return None;
++        }
++        Some((deadline, track.period))
++    }
++}
+diff --git a/drivers/gpu/drm/asahi/g16_cooling.rs b/drivers/gpu/drm/asahi/g16_cooling.rs
+new file mode 100644
+index 0000000..a8f8fc1
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16_cooling.rs
+@@ -0,0 +1,147 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++//! The GPU as a thermal cooling device.
++//!
++//! Cooling state `n` caps the firmware at `n` performance states below the
++//! top, through region C's performance-state cap. The firmware rereads the
++//! cap by itself, so the driver writes it before its next publication. The
++//! lowest cap is state 1, the slowest state above off.
++//!
++//! The power callbacks let the power allocator governor budget the GPU with
++//! the CPUs. Power at each state follows dynamic power, frequency times the
++//! square of the core voltage, scaled to the device tree's maximum power.
++//! Requested power is that maximum times the share of time the GPU had work
++//! in flight.
++
++use core::sync::atomic::{AtomicU32, Ordering};
++use kernel::{
++    new_spinlock,
++    prelude::*,
++    sync::{Arc, SpinLock},
++    thermal,
++    time::{Instant, Monotonic},
++};
++
++/// Time with work in flight, sampled by `requested_power`.
++struct Busy {
++    /// Start of the current busy period, if work is in flight.
++    since: Option<Instant<Monotonic>>,
++    /// Busy time before `since`, in ns.
++    total: i64,
++    /// The previous sample: when, and `total` then.
++    sampled: Instant<Monotonic>,
++    sampled_total: i64,
++}
++
++#[pin_data]
++pub(crate) struct Cooling {
++    /// The top performance state.
++    top: u32,
++    /// Power in mW at each performance state, from off to the top.
++    power: KVec<u32>,
++    /// The cooling state the thermal core set.
++    state: AtomicU32,
++    #[pin]
++    busy: SpinLock<Busy>,
++}
++
++impl Cooling {
++    pub(crate) fn new(platform: &crate::g16_platform::Platform) -> Result<Arc<Self>> {
++        let top = platform.max_pstate();
++        let (frequency, voltage) = (&platform.freq_a, platform.core_voltage());
++        if voltage.len() != frequency.len() || top == 0 {
++            return Err(EINVAL);
++        }
++        let dynamic = |state: usize| u64::from(frequency[state]) * u64::from(voltage[state]).pow(2);
++        let full = dynamic(top as usize);
++        let mut power = KVec::with_capacity(frequency.len(), GFP_KERNEL)?;
++        for state in 0..frequency.len() {
++            power.push(
++                (u64::from(platform.maximum_power) * dynamic(state) / full) as u32,
++                GFP_KERNEL,
++            )?;
++        }
++        let now = Instant::now();
++        Arc::pin_init(
++            pin_init!(Self {
++                top,
++                power,
++                state: AtomicU32::new(0),
++                busy <- new_spinlock!(Busy { since: None, total: 0, sampled: now, sampled_total: 0 }),
++            }),
++            GFP_KERNEL,
++        )
++    }
++
++    /// The performance-state cap the current cooling state asks for.
++    pub(crate) fn cap(&self) -> u32 {
++        self.top - self.state.load(Ordering::Relaxed)
++    }
++
++    /// Note that work went in flight, or that the last of it retired.
++    pub(crate) fn set_busy(&self, busy: bool) {
++        let now = Instant::now();
++        let mut record = self.busy.lock();
++        match (record.since, busy) {
++            (None, true) => record.since = Some(now),
++            (Some(since), false) => {
++                record.total += (now - since).as_nanos();
++                record.since = None;
++            }
++            _ => {}
++        }
++    }
++}
++
++/// The registered device's callbacks.
++pub(crate) struct Device(pub(crate) Arc<Cooling>);
++
++#[vtable]
++impl thermal::CoolingDevice for Device {
++    fn max_state(&self) -> Result<u64> {
++        Ok(u64::from(self.0.top - 1))
++    }
++
++    fn cur_state(&self) -> Result<u64> {
++        Ok(u64::from(self.0.state.load(Ordering::Relaxed)))
++    }
++
++    fn set_cur_state(&self, state: u64) -> Result {
++        if state >= u64::from(self.0.top) {
++            return Err(EINVAL);
++        }
++        self.0.state.store(state as u32, Ordering::Relaxed);
++        Ok(())
++    }
++
++    fn requested_power(&self) -> Result<u32> {
++        let now = Instant::now();
++        let mut record = self.0.busy.lock();
++        let total = record.total + record.since.map_or(0, |since| (now - since).as_nanos());
++        let busy = total - record.sampled_total;
++        let elapsed = (now - record.sampled).as_nanos();
++        record.sampled = now;
++        record.sampled_total = total;
++        drop(record);
++        if elapsed <= 0 {
++            return Ok(0);
++        }
++        let full = i64::from(self.0.power[self.0.top as usize]);
++        Ok((full * busy.clamp(0, elapsed) / elapsed) as u32)
++    }
++
++    fn state_to_power(&self, state: u64) -> Result<u32> {
++        if state >= u64::from(self.0.top) {
++            return Err(EINVAL);
++        }
++        Ok(self.0.power[(u64::from(self.0.top) - state) as usize])
++    }
++
++    fn power_to_state(&self, power: u32) -> Result<u64> {
++        let top = self.0.top;
++        Ok((0..top - 1)
++            .find(|&state| self.0.power[(top - state) as usize] <= power)
++            .unwrap_or(top - 1)
++            .into())
++    }
++}
+diff --git a/drivers/gpu/drm/asahi/g16_drm.rs b/drivers/gpu/drm/asahi/g16_drm.rs
+index 9dd8f60..633515f 100644
+--- a/drivers/gpu/drm/asahi/g16_drm.rs
++++ b/drivers/gpu/drm/asahi/g16_drm.rs
+@@ -213,6 +213,8 @@ pub(crate) struct Data {
+     admission: Mutex<KVec<dma_fence::Fence>>,
+     failed: AtomicBool,
+     notifications: Arc<crate::g16::Notifications>,
++    /// The GPU's cooling device, unregistered before `runtime` goes.
++    _cooling: Option<kernel::thermal::Registration<crate::g16_cooling::Device>>,
+     /// Debug view of the firmware's memory; declared before `runtime` so it
+     /// is removed before the firmware regions can be freed.
+     _fw_mem: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::FwMem>>>,
+@@ -236,6 +238,7 @@ pub(crate) struct Data {
+     _dep_stats: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::DepStats>>>,
+     _lane_cap: Pin<KBox<kernel::debugfs::File<crate::g16_timeline::CapKnob>>>,
+     _debugfs: kernel::debugfs::Dir,
++    cadence: Arc<crate::g16_cadence::Cadence>,
+ }
+ 
+ #[vtable]
+@@ -427,6 +430,16 @@ pub(crate) fn register<'a>(
+         ),
+         GFP_KERNEL,
+     )?;
++    let bound: &'a platform::Device<Bound> = pdev;
++    let cooling = kernel::thermal::Registration::new(
++        bound.as_ref(),
++        0,
++        c_str!("gpu"),
++        Ok::<_, Error>(crate::g16_cooling::Device(runtime.cooling.clone())),
++    )
++    .inspect_err(|e| dev_warn!(pdev.as_ref(), "G16: no cooling device: {:?}\n", e))
++    .ok();
++    let cadence = runtime.cadence.clone();
+     let data = try_pin_init!(Data {
+         gpu_revision: runtime.gpu_revision,
+         core_mask: runtime.core_mask, maximum_frequency_khz: runtime.maximum_frequency_khz,
+@@ -434,6 +447,7 @@ pub(crate) fn register<'a>(
+         admission <- kernel::new_mutex!(KVec::new()),
+         failed: AtomicBool::new(false),
+         notifications: runtime.notifications.clone(),
++        _cooling: cooling,
+         _fw_mem: fw_mem,
+         runtime <- kernel::new_mutex!(runtime),
+         engine <- kernel::new_mutex!(Engine {
+@@ -454,9 +468,9 @@ pub(crate) fn register<'a>(
+         _native_mesh_attribute: native_mesh_attribute,
+         _dep_stats: dep_stats,
+         _lane_cap: lane_cap,
+-        _debugfs: dir, });
++        _debugfs: dir,
++        cadence, });
+     let device = drm::UnregisteredDevice::<Driver>::new(pdev, data)?;
+-    let bound: &'a platform::Device<Bound> = pdev;
+     // SAFETY: The registration is stored in the platform driver data and dropped on unbind.
+     unsafe {
+         drm::Registration::new(pdev.as_ref(), device, Ok::<_, Error>(RegData { pdev: bound }), 0)
+@@ -1233,7 +1247,7 @@ struct SubmissionJob {
+     history: Option<[KVec<Option<crate::g16::Stamp>>; 2]>,
+ }
+ 
+-struct Completion;
++struct Completion(Arc<crate::g16_cadence::Cadence>);
+ struct OutputSync {
+     object: drm::syncobj::SyncObj,
+     chain: Option<dma_fence::FenceChain>,
+diff --git a/drivers/gpu/drm/asahi/g16_drm_pump.rs b/drivers/gpu/drm/asahi/g16_drm_pump.rs
+index 760007c..928688e 100644
+--- a/drivers/gpu/drm/asahi/g16_drm_pump.rs
++++ b/drivers/gpu/drm/asahi/g16_drm_pump.rs
+@@ -504,6 +504,9 @@ impl sched::JobImpl for SubmissionJob {
+ 
+ #[vtable]
+ impl dma_fence::FenceOps for Completion {
++    fn set_deadline(self: &dma_fence::FenceObject<Self>, deadline: kernel::time::Instant<kernel::time::Monotonic>) {
++        self.0.add_deadline(deadline);
++    }
+     fn get_driver_name<'a>(self: &'a dma_fence::FenceObject<Self>) -> &'a kernel::str::CStr {
+         c_str!("asahi")
+     }
+diff --git a/drivers/gpu/drm/asahi/g16_drm_submit.rs b/drivers/gpu/drm/asahi/g16_drm_submit.rs
+index 344608a..0245abc 100644
+--- a/drivers/gpu/drm/asahi/g16_drm_submit.rs
++++ b/drivers/gpu/drm/asahi/g16_drm_submit.rs
+@@ -187,7 +187,7 @@ impl File {
+         // order. Give each submission its own timeline: a later independent
+         // completion must never subsume an earlier dependency in DRM.
+         let unique = dma_fence::FenceContexts::new(1, c_str!("asahi_m4"), FENCE_KEY)?
+-            .new_fence(0, Completion)?;
++            .new_fence(0, Completion(device.cadence.clone()))?;
+         // A queue that has failed work stays failed: refuse new work instead
+         // of accepting jobs that can only complete with ECANCELED.
+         if queue.firmware.lock().rejected {
+diff --git a/drivers/gpu/drm/asahi/g16_fw.rs b/drivers/gpu/drm/asahi/g16_fw.rs
+index 253bcdc..1faa732 100644
+--- a/drivers/gpu/drm/asahi/g16_fw.rs
++++ b/drivers/gpu/drm/asahi/g16_fw.rs
+@@ -21,6 +21,25 @@ pub(crate) const CONTROL_AUX: u64 = 0xffff_fc20_0014_8000;
+ pub(crate) const OPERAND_TABLE: u64 = 0x70_0040_8000;
+ pub(crate) const TIMESTAMP_BASE: u64 = 0xffff_fc21_8140_0000;
+ pub(crate) const TIMESTAMP_SIZE: u64 = 0x400_0000;
++/// Region C submission counters, kept as macOS keeps them: submissions in
++/// flight, and every submission started since boot.
++pub(crate) const REGION_C_ACTIVE: u64 = 0x7c;
++pub(crate) const REGION_C_STARTED: u64 = 0x80;
++/// Region C performance-state cap, in hundredths of a state.
++pub(crate) const REGION_C_PSTATE_CAP: u64 = 0x98;
++/// Region C display cadence: a vblank, and the frame period, in counter
++/// ticks. The firmware rereads both on control message 0x22.
++pub(crate) const REGION_C_DISPLAY_PHASE: u64 = 0x988;
++pub(crate) const REGION_C_DISPLAY_PERIOD: u64 = 0x990;
++/// The frame periods macOS publishes: 240 Hz to 60 Hz.
++pub(crate) const DISPLAY_PERIODS: core::ops::RangeInclusive<u64> = 100_000..=400_000;
++
++/// Control message telling the firmware to reread the display cadence.
++pub(crate) fn display_cadence() -> [u8; 0x40] {
++    let mut out = [0; 0x40];
++    out[..4].copy_from_slice(&0x22u32.to_le_bytes());
++    out
++}
+ 
+ /// Control message releasing firmware's GPU context ID binding for a context
+ /// object. The fields are copied from bytes firmware maintains in the context.
+diff --git a/drivers/gpu/drm/asahi/g16_platform.rs b/drivers/gpu/drm/asahi/g16_platform.rs
+index c7f4ee9..404cd12 100644
+--- a/drivers/gpu/drm/asahi/g16_platform.rs
++++ b/drivers/gpu/drm/asahi/g16_platform.rs
+@@ -14,7 +14,26 @@ const REGISTER_LIMIT: u64 = 0xffff_fc21_8100_0000;
+ const MCC_BASE: u64 = 0x2201c4000;
+ const MCC_SIZE: u32 = 0x18000;
+ const REGION_C_IDLE_ENABLE: usize = 0x30;
+-const REGION_C_CLOCK_GATED_OFF_DELAY_MS: usize = 0x9bc;
++const REGION_C_IDLE_PREDICTION: usize = 0x34;
++
++/// Automatic idle timing, from `/arm-io/sgx`: region C offset, property and
++/// the value macOS 26.6.2 writes on the J713, whose ADT has none of them.
++/// Weights and confidences are binary32, the rest unsigned.
++const IDLE_TIMING: [(usize, &CStr, u32); 13] = [
++    (0x7c4, c_str!("apple,sgx-gpu-idleoff-standby-timer"), 1250), // us
++    (0x7c8, c_str!("apple,sgx-gpu-idleoff-prob-init-val"), 0x3f80_0000), // 1.0
++    (0x7cc, c_str!("apple,sgx-gpu-idleoff-fn-hit"), 0x3f4c_cccd), // 0.8
++    (0x7d0, c_str!("apple,sgx-gpu-idleoff-fi-hit"), 0x3e4c_cccd), // 0.2
++    (0x7d4, c_str!("apple,sgx-gpu-idleoff-fn-miss"), 0x3f66_6666), // 0.9
++    (0x7d8, c_str!("apple,sgx-gpu-idleoff-fi-miss"), 0x3dcc_cccd), // 0.1
++    (0x7dc, c_str!("apple,sgx-gpu-idleoff-nei-hit"), 0x3e80_0000), // 0.25
++    (0x7e0, c_str!("apple,sgx-gpu-idleoff-min_conf"), 0x3f33_3333), // 0.7
++    (0x7e4, c_str!("apple,sgx-gpu-idleoff-high-conf"), 0x3f66_6666), // 0.9
++    (0x7e8, c_str!("apple,sgx-gpu-idleoff-reset-iter"), 6),
++    (0x9b8, c_str!("apple,sgx-gpu-idle-off-delay-ms"), 2),
++    (0x9bc, c_str!("apple,sgx-gpu-fender-idle-off-delay-ms"), 40),
++    (0x9c0, c_str!("apple,sgx-gpu-fw-early-wake-timeout-ms"), 5),
++];
+ 
+ 
+ 
+@@ -70,6 +89,7 @@ pub(crate) struct Platform {
+     relative_b: KVec<u32>,
+     pub(crate) maximum_power: u32,
+     pub(crate) core_mask: u32,
++    pub(crate) sensor_mask: u32,
+     revision: u32,
+     pub(crate) period_ms: u32,
+     pub(crate) period_clocks: u32,
+@@ -124,6 +144,10 @@ impl Platform {
+         if core_mask == 0 || core_mask & !0x3ff != 0 {
+             return Err(EINVAL);
+         }
++        let sensor_mask: u32 = node.get_property(c_str!("apple,m4-sensor-mask"))?;
++        if sensor_mask == 0 || sensor_mask & !0xffff != 0 {
++            return Err(EINVAL);
++        }
+         let mut this = Self {
+             core_voltage: ladder(&node, c_str!("apple,m4-core-voltage"))?,
+             memory_voltage: ladder(&node, c_str!("apple,m4-memory-voltage"))?,
+@@ -138,6 +162,7 @@ impl Platform {
+             freq_b,
+             maximum_power,
+             core_mask,
++            sensor_mask,
+             period_ms,
+             period_clocks,
+             registers: KVec::new(),
+@@ -330,6 +355,13 @@ impl Platform {
+         for i in 0..self.states() {
+             put32(&mut out, 0x1848 + i * 4, 1.02f32.to_bits());
+         }
++        // The firmware's revision codes: A0 1, B0 3, B1 4.
++        let revision_code = match self.revision {
++            0x00 => 1,
++            0x10 => 3,
++            0x11 => 4,
++            _ => return Err(EINVAL),
++        };
+         for (off, value) in [
+             (0xe90, 0x8132),
+             (0xe94, self.revision >> 4),
+@@ -342,6 +374,9 @@ impl Platform {
+             (0xee0, 1),
+             (0xee4, 1),
+             (0xee8, 1),
++            (0xfb8, 0x1b),
++            (0xfbc, revision_code),
++            (0xfc0, 10),
+             (0xfc4, self.max_pstate()),
+             (0x1cd8, self.max_pstate()),
+             (0x2604, 1),
+@@ -366,27 +401,37 @@ impl Platform {
+         // zero, T8132 keeps PMGR GFX ACTUAL at 15 even with no queued work.
+         // Setting it to one permits idle state 0 and wake on new submissions.
+         put32(&mut out, REGION_C_IDLE_ENABLE, 1);
+-        // Keep GFX clock-gated briefly before powering it off. On T8132,
+-        // 40 permits ACTUAL 4 between frames and state 0 after quiet time.
+-        put32(&mut out, REGION_C_CLOCK_GATED_OFF_DELAY_MS, 40);
++        // Predict idle periods rather than using fixed timing, as macOS does.
++        put32(&mut out, REGION_C_IDLE_PREDICTION, 1);
++        for (off, name, default) in IDLE_TIMING {
++            put32(&mut out, off, adt_word(&self.node, name, Some(default))?);
++        }
++        // Performance-state limits, in hundredths of a state.
++        let top_state = 100 * self.max_pstate();
+         for (off, value) in [
+             (0x78, 1),
+             (0x7ec, 1),
+             (0x7f0, 1),
+             (0xe28, crate::module_parameters::fault_control.value()),
+             (0xe2c, 1),
+-            (0x24, 4096),
+             (0x998, 32),
+             (0x99c, 8),
+             (0x9a0, 256),
+             (0x9a4, 1),
+-            (0x9c8, 64),
+-            (0x9cc, 64),
+-            (0x9d0, 2),
++            // Watchdog thresholds, in checks of unchanged work: relaxed,
++            // ordinary, recovery escalation and channel-mask intervention.
++            (0x24, 3000),
++            (0x9c8, 40),
++            (0x9cc, 50),
++            (0x9d0, 1),
++            // Keepalive performance and off-mode thresholds, in hundredths
++            // of a state.
++            (0x7f4, 100),
++            (0x7f8, 100),
+             (0x84, self.maximum_power),
+-            (0x88, 1000),
+-            (0x8c, 1000),
+-            (0x98, 1000),
++            (0x88, top_state),
++            (0x8c, top_state),
++            (0x98, top_state),
+         ] {
+             put32(&mut out, off, value);
+         }
+@@ -403,6 +448,11 @@ impl Platform {
+         self.freq_a.len()
+     }
+ 
++    /// Core voltage in mV at each performance state.
++    pub(crate) fn core_voltage(&self) -> &[u32] {
++        &self.core_voltage
++    }
++
+     /// Index of the top performance state.
+     pub(crate) fn max_pstate(&self) -> u32 {
+         (self.states() - 1) as u32
+diff --git a/drivers/gpu/drm/asahi/g16_power.rs b/drivers/gpu/drm/asahi/g16_power.rs
+index 632e73e..ef2cbfc 100644
+--- a/drivers/gpu/drm/asahi/g16_power.rs
++++ b/drivers/gpu/drm/asahi/g16_power.rs
+@@ -56,6 +56,10 @@ fn filter(count: u32, period: u32, request: Option<u32>) -> Result<Filter> {
+     })
+ }
+ 
++/// The MTR sensors behind the fast-die limit and the SoC-hot alarm route.
++const FAST_DIE_SENSORS: u64 =
++    (1 << 3) | (1 << 4) | (1 << 6) | (1 << 8) | (1 << 11) | (1 << 13) | (1 << 14);
++
+ impl Platform {
+     /// Entire source-built bundle, including the firmware's power controllers.
+     pub(crate) fn bundle(&self, entropy: u32) -> Result<KVec<u8>> {
+@@ -66,12 +70,11 @@ impl Platform {
+         out[crate::g16_fw::MAIN_OFFSET..crate::g16_fw::MAIN_OFFSET + main.len()]
+             .copy_from_slice(&main);
+         put64(&mut out, 0x8ed0, 0xffff_fc20_000f_3440 + 0x80);
+-        // All sensors in T8132's GPU metrology chain, including the sensors
+-        // outside the fast-die controller's subset. Firmware needs this mask
+-        // to configure the chain and resolve an incoming thermal alarm.
+-        let mtr_sensor_mask = (1 << 0) | (1 << 3) | (1 << 4) | (1 << 5)
+-            | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 11) | (1 << 13) | (1 << 14);
+-        put64(&mut out, 0x8ed8, mtr_sensor_mask);
++        // m1n1 derives this mask from the actual chip's metrology fuses.
++        put64(&mut out, 0x8ed8, self.sensor_mask.into());
++        put64(&mut out, 0x8288, FAST_DIE_SENSORS);
++        put32(&mut out, 0x8290, 125);
++        put32(&mut out, 0x8294, 1);
+         put64(&mut out, 0xb698, 0xffff_fc20_c050_0000);
+         self.power_data(&mut out)?;
+         put32(&mut out, 0xb754, entropy);
+@@ -283,11 +286,7 @@ impl Platform {
+         if delta > u32::MAX / 100 {
+             return Err(EINVAL);
+         }
+-        put64(
+-            out,
+-            0x75e8,
+-            (1 << 3) | (1 << 4) | (1 << 6) | (1 << 8) | (1 << 11) | (1 << 13) | (1 << 14),
+-        );
++        put64(out, 0x75e8, FAST_DIE_SENSORS);
+         ints!(0x75f0 => release,
+             0x75f8 => 4, 0x7630 => duty, 0x7634 => max_scaled, 0x7638 => max_scaled,
+             0x763c => (F32::from(delta)*f32!(100.0)).to_u32_checked().ok_or(EINVAL)?,
+diff --git a/drivers/gpu/drm/asahi/g16_runtime_compute.rs b/drivers/gpu/drm/asahi/g16_runtime_compute.rs
+index f4c1482..ed46f9c 100644
+--- a/drivers/gpu/drm/asahi/g16_runtime_compute.rs
++++ b/drivers/gpu/drm/asahi/g16_runtime_compute.rs
+@@ -289,6 +289,7 @@ impl Bootstrap {
+         // Capacity was reserved with the flight in reserve_flight.
+         let flight = self.flights.last().ok_or(EIO)?;
+         self.ledger.add(flight)?;
++        self.count_submissions(1)?;
+         #[cfg(CONFIG_APPLE_PMP_REPORT)]
+         // SAFETY: the helper publishes only scalar activity; it neither retains
+         // a GPU reference nor performs MMIO/locking in this runtime context.
+diff --git a/drivers/gpu/drm/asahi/g16_runtime_publish.rs b/drivers/gpu/drm/asahi/g16_runtime_publish.rs
+index d345370..6159ee3 100644
+--- a/drivers/gpu/drm/asahi/g16_runtime_publish.rs
++++ b/drivers/gpu/drm/asahi/g16_runtime_publish.rs
+@@ -254,8 +254,16 @@ impl Bootstrap {
+             return Ok(());
+         }
+         self.render_failed = true;
++        self.publish_cadence()?;
+         let config = g16_fw::MainConfig::bootstrap(g16_fw::BUNDLE_ADDRESS);
+         let fw = self._firmware_space.as_mut().ok_or(EIO)?;
++        // The firmware rereads its performance-state cap by itself.
++        let cap = self.cooling.cap();
++        if cap != self.applied_cap {
++            let region_c = g16_fw::RootPointers::bootstrap().region_c;
++            fw.write_live(region_c + g16_fw::REGION_C_PSTATE_CAP, &(cap * 100).to_le_bytes())?;
++            self.applied_cap = cap;
++        }
+         let mut tails: [Option<u32>; 12] = [None; 12];
+         let mut kicks = 0u32;
+         // Fragment transports must precede tiling, matching normal publication.
+@@ -321,6 +329,85 @@ impl Bootstrap {
+         Ok(())
+     }
+ 
++    /// Publish the display cadence when it has changed: a new period, or a
++    /// phase more than 100 us off the published grid. With no display
++    /// deadlines coming, publish the shortest period. A full control ring
++    /// leaves it for the next pass.
++    fn publish_cadence(&mut self) -> Result {
++        if crate::module_parameters::display_cadence.value() == 0 {
++            return Ok(());
++        }
++        let now = kernel::time::Instant::<kernel::time::Monotonic>::now();
++        let display = self.cadence.current(now);
++        let release = *g16_fw::DISPLAY_PERIODS.start();
++        if display.is_none() && self.published_cadence.is_some_and(|(_, last)| last == release) {
++            return Ok(());
++        }
++        let (counter, hz): (u64, u64);
++        // SAFETY: These instructions only read architectural timer registers.
++        unsafe {
++            core::arch::asm!("isb", "mrs {c}, cntpct_el0", "mrs {f}, cntfrq_el0",
++                             c = out(reg) counter, f = out(reg) hz);
++        }
++        if hz == 0 {
++            return Err(EIO);
++        }
++        // Both spans are under a second, so this cannot overflow.
++        let ticks = |ns: i64| ns * hz as i64 / 1_000_000_000;
++        let (phase, period) = match display {
++            Some((deadline, period_ns)) => (
++                counter.wrapping_add_signed(ticks((deadline - now).as_nanos())),
++                (ticks(period_ns) as u64)
++                    .clamp(*g16_fw::DISPLAY_PERIODS.start(), *g16_fw::DISPLAY_PERIODS.end()),
++            ),
++            // Left at a display's period, the firmware holds headless work
++            // back to it: on the J713, vkmark scores about 3,700 at 60 Hz,
++            // 6,000 with no cadence ever published, and 7,300 at 240 Hz.
++            None => (counter, release),
++        };
++        if let Some((last_phase, last_period)) = self.published_cadence {
++            let off = (phase.wrapping_sub(last_phase) as i64).rem_euclid(last_period as i64) as u64;
++            let off = off.min(last_period - off);
++            if last_period == period && off <= hz / 10_000 {
++                return Ok(());
++            }
++        }
++        let region_c = g16_fw::RootPointers::bootstrap().region_c;
++        let words = [
++            (g16_fw::REGION_C_DISPLAY_PHASE, phase.to_le_bytes()),
++            (g16_fw::REGION_C_DISPLAY_PERIOD, period.to_le_bytes()),
++        ];
++        let fw = self._firmware_space.as_mut().ok_or(EIO)?;
++        fw.write_batch(words.len(), |n| (region_c + words[n].0, &words[n].1[..]))?;
++        crate::mem::sync();
++        if self.publish_control(&g16_fw::display_cadence())?.is_some() {
++            if self.published_cadence.map(|(_, last)| last) != Some(period) {
++                dev_info!(self.dev.as_ref(), "G16: display cadence {} ticks\n", period);
++            }
++            self.published_cadence = Some((phase, period));
++        }
++        Ok(())
++    }
++
++    /// Publish region C's submission counters, as macOS does: the number of
++    /// submissions in flight, and a count of every one started.
++    pub(super) fn count_submissions(&mut self, started: u32) -> Result {
++        self.submissions = self.submissions.wrapping_add(started);
++        // Work went in flight, or the last of it retired.
++        match (started, self.flights.len()) {
++            (1, 1) => self.cooling.set_busy(true),
++            (0, 0) => self.cooling.set_busy(false),
++            _ => {}
++        }
++        let region_c = g16_fw::RootPointers::bootstrap().region_c;
++        let words = [
++            (g16_fw::REGION_C_ACTIVE, (self.flights.len() as u32).to_le_bytes()),
++            (g16_fw::REGION_C_STARTED, self.submissions.to_le_bytes()),
++        ];
++        let fw = self._firmware_space.as_mut().ok_or(EIO)?;
++        fw.write_batch(words.len(), |n| (region_c + words[n].0, &words[n].1[..]))
++    }
++
+     pub(crate) fn poison(&mut self) {
+         self.render_failed = true;
+     }
+diff --git a/drivers/gpu/drm/asahi/g16_runtime_queues.rs b/drivers/gpu/drm/asahi/g16_runtime_queues.rs
+index 0aefca6..c1dd1ee 100644
+--- a/drivers/gpu/drm/asahi/g16_runtime_queues.rs
++++ b/drivers/gpu/drm/asahi/g16_runtime_queues.rs
+@@ -132,7 +132,7 @@ impl Bootstrap {
+     /// Returns the control cursor that acknowledges it, or None when full.
+     pub(super) fn destroy_queue_context(&mut self, base: u64) -> Result<Option<u32>> {
+         let context = base + 0x4140;
+-        let fw = self._firmware_space.as_mut().ok_or(EIO)?;
++        let fw = self._firmware_space.as_ref().ok_or(EIO)?;
+         let ids = fw.read_u32(context)?;
+         let fields = [
+             (fw.read_u32(context + 0x24)? >> 16) as u8,
+@@ -140,6 +140,12 @@ impl Bootstrap {
+             (ids >> 8) as u8,
+             fw.read_u32(context + 4)? as u8,
+         ];
++        self.publish_control(&g16_fw::destroy_context(context, fields))
++    }
++
++    /// Publish one device-control message without waiting. Returns the
++    /// control cursor that acknowledges it, or None when the ring is full.
++    pub(crate) fn publish_control(&mut self, message: &[u8; 0x40]) -> Result<Option<u32>> {
+         let guard = self._sgx.try_access().ok_or(ENODEV)?;
+         let head = guard.try_read32(0xd640c0)?;
+         let ack = guard.try_read32(0xd640c8)?;
+@@ -153,10 +159,8 @@ impl Bootstrap {
+             return Ok(None);
+         }
+         let control = g16_fw::MainConfig::bootstrap(g16_fw::BUNDLE_ADDRESS).channels[12].ring;
+-        fw.write_live(
+-            control + u64::from(tail) * 64,
+-            &g16_fw::destroy_context(context, fields),
+-        )?;
++        let fw = self._firmware_space.as_mut().ok_or(EIO)?;
++        fw.write_live(control + u64::from(tail) * 64, message)?;
+         crate::mem::sync();
+         let guard = self._sgx.try_access().ok_or(ENODEV)?;
+         guard.try_write32(successor, 0xd60060)?;
+diff --git a/drivers/gpu/drm/asahi/g16_runtime_render.rs b/drivers/gpu/drm/asahi/g16_runtime_render.rs
+index 18945ca..956e87f 100644
+--- a/drivers/gpu/drm/asahi/g16_runtime_render.rs
++++ b/drivers/gpu/drm/asahi/g16_runtime_render.rs
+@@ -551,6 +551,7 @@ impl Bootstrap {
+         // Capacity was reserved with the flight in reserve_flight.
+         let flight = self.flights.last().ok_or(EIO)?;
+         self.ledger.add(flight)?;
++        self.count_submissions(1)?;
+         #[cfg(CONFIG_APPLE_PMP_REPORT)]
+         // SAFETY: the helper publishes only scalar activity; it neither retains
+         // a GPU reference nor performs MMIO/locking in this runtime context.
+diff --git a/drivers/gpu/drm/asahi/g16_runtime_retire.rs b/drivers/gpu/drm/asahi/g16_runtime_retire.rs
+index 61a7c15..82ea6f8 100644
+--- a/drivers/gpu/drm/asahi/g16_runtime_retire.rs
++++ b/drivers/gpu/drm/asahi/g16_runtime_retire.rs
+@@ -339,6 +339,7 @@ impl Bootstrap {
+             // a GPU reference nor performs MMIO/locking in this runtime context.
+             unsafe { kernel::bindings::apple_pmp_cpu_vote_gpu_activity(self.flights.len() as u32) };
+             self.ledger.remove(&flight)?;
++            self.count_submissions(0)?;
+             let root = match &flight.render {
+                 Some(render) => render.root,
+                 None => flight.client.lock().roots().low,
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+index 05c71a5..53da628 100644
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -102,6 +102,7 @@
+ #include <linux/soc/apple/rtkit.h>
+ #include <linux/sys_soc.h>
+ #include <linux/task_work.h>
++#include <linux/thermal.h>
+ #include <linux/tracepoint.h>
+ #include <linux/usb.h>
+ #include <linux/wait.h>
+diff --git a/rust/kernel/dma_fence.rs b/rust/kernel/dma_fence.rs
+index 3aa90c1..f37fbb2 100644
+--- a/rust/kernel/dma_fence.rs
++++ b/rust/kernel/dma_fence.rs
+@@ -164,6 +164,25 @@ pub trait FenceOps: Sized + Send + Sync {
+     fn signaled(self: &FenceObject<Self>) -> bool {
+         false
+     }
++
++    /// An atomic-context hint for when a waiter would like completion.
++    fn set_deadline(self: &FenceObject<Self>, _deadline: crate::time::Instant<crate::time::Monotonic>) {}
++}
++
++unsafe extern "C" fn set_deadline_cb<T: FenceOps>(
++    fence: *mut bindings::dma_fence,
++    deadline: bindings::ktime_t,
++) {
++    if deadline < 0 {
++        return;
++    }
++    // SAFETY: The fence core holds a reference to this FenceObject<T> for
++    // the call, so its inner data also remains alive until we return.
++    let p = unsafe { crate::container_of!(fence, FenceObject<T>, fence) };
++    // SAFETY: Nonnegative ktime_t values fit Instant's valid range.
++    let deadline = unsafe { crate::time::Instant::from_ktime(deadline) };
++    // SAFETY: The reference held by the caller keeps the object alive.
++    T::set_deadline(unsafe { &*p }, deadline);
+ }
+ 
+ unsafe extern "C" fn get_driver_name_cb<T: FenceOps>(
+@@ -244,7 +263,11 @@ impl<T: FenceOps> FenceObject<T> {
+         },
+         wait: None, // Deprecated
+         release: Some(release_cb::<T>),
+-        set_deadline: None,
++        set_deadline: if T::HAS_SET_DEADLINE {
++            Some(set_deadline_cb::<T>)
++        } else {
++            None
++        },
+     };
+ }
+ 
+diff --git a/rust/kernel/lib.rs b/rust/kernel/lib.rs
+index 128f37c..f9f64fb 100644
+--- a/rust/kernel/lib.rs
++++ b/rust/kernel/lib.rs
+@@ -156,6 +156,8 @@ pub mod std_vendor;
+ pub mod str;
+ pub mod sync;
+ pub mod task;
++#[cfg(CONFIG_THERMAL_OF)]
++pub mod thermal;
+ pub mod time;
+ pub mod tracepoint;
+ pub mod transmute;
+diff --git a/rust/kernel/thermal.rs b/rust/kernel/thermal.rs
+new file mode 100644
+index 0000000..4db07f1
+--- /dev/null
++++ b/rust/kernel/thermal.rs
+@@ -0,0 +1,231 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! Thermal cooling devices.
++//!
++//! C header: [`include/linux/thermal.h`](srctree/include/linux/thermal.h)
++
++use crate::{
++    bindings,
++    device::{
++        Bound,
++        Device, //
++    },
++    error::{
++        from_err_ptr,
++        from_result,
++        VTABLE_DEFAULT_ERROR, //
++    },
++    ffi::{
++        c_int,
++        c_ulong, //
++    },
++    prelude::*,
++};
++use core::ptr::NonNull;
++
++/// The callbacks of a cooling device.
++///
++/// Cooling states run from 0, no cooling, to [`CoolingDevice::max_state`].
++///
++/// A device that also implements the three power callbacks is a power actor:
++/// the power allocator governor budgets it in mW.
++#[vtable]
++pub trait CoolingDevice: Send + Sync {
++    /// The highest cooling state.
++    fn max_state(&self) -> Result<u64>;
++
++    /// The current cooling state.
++    fn cur_state(&self) -> Result<u64>;
++
++    /// Change the cooling state.
++    fn set_cur_state(&self, state: u64) -> Result;
++
++    /// The power in mW the device would consume now without cooling.
++    fn requested_power(&self) -> Result<u32> {
++        build_error!(VTABLE_DEFAULT_ERROR)
++    }
++
++    /// The most power in mW the device consumes in `state`.
++    fn state_to_power(&self, _state: u64) -> Result<u32> {
++        build_error!(VTABLE_DEFAULT_ERROR)
++    }
++
++    /// The least cooling state in which the device consumes at most `power` mW.
++    fn power_to_state(&self, _power: u32) -> Result<u64> {
++        build_error!(VTABLE_DEFAULT_ERROR)
++    }
++}
++
++/// A cooling device registered with the thermal core, bound to the thermal
++/// zones whose cooling maps name its device's node.
++///
++/// It is unregistered when dropped.
++///
++/// # Invariants
++///
++/// `cdev` is a registered cooling device whose `devdata` points to `data`.
++pub struct Registration<T: CoolingDevice> {
++    cdev: NonNull<bindings::thermal_cooling_device>,
++    data: Pin<KBox<T>>,
++}
++
++// SAFETY: The registration only holds a pointer the thermal core owns and the
++// callbacks' data, which is `Send`.
++unsafe impl<T: CoolingDevice> Send for Registration<T> {}
++// SAFETY: A shared registration gives access to nothing but `data`, which is
++// `Sync`.
++unsafe impl<T: CoolingDevice> Sync for Registration<T> {}
++
++impl<T: CoolingDevice> Registration<T> {
++    const OPS: bindings::thermal_cooling_device_ops = bindings::thermal_cooling_device_ops {
++        get_max_state: Some(Self::get_max_state),
++        get_cur_state: Some(Self::get_cur_state),
++        set_cur_state: Some(Self::set_cur_state),
++        get_requested_power: if T::HAS_REQUESTED_POWER {
++            Some(Self::get_requested_power)
++        } else {
++            None
++        },
++        state2power: if T::HAS_STATE_TO_POWER {
++            Some(Self::state2power)
++        } else {
++            None
++        },
++        power2state: if T::HAS_POWER_TO_STATE {
++            Some(Self::power2state)
++        } else {
++            None
++        },
++    };
++
++    /// Register `data` as cooling device `id` of `dev`'s device tree node,
++    /// named `name`.
++    pub fn new(
++        dev: &Device<Bound>,
++        id: u32,
++        name: &CStr,
++        data: impl PinInit<T, Error>,
++    ) -> Result<Self> {
++        let data = KBox::pin_init(data, GFP_KERNEL)?;
++        let devdata: *const T = &*data;
++        // SAFETY: `dev` is a valid, bound device, so its node is valid or null.
++        let np = unsafe { (*dev.as_raw()).of_node };
++        // SAFETY: `name` is copied by the thermal core. `OPS` is static, and
++        // `devdata` stays valid until `drop` has unregistered the device.
++        let cdev = from_err_ptr(unsafe {
++            bindings::thermal_of_cooling_device_register(
++                np,
++                id,
++                name.as_char_ptr(),
++                devdata.cast_mut().cast(),
++                &Self::OPS,
++            )
++        })?;
++        // INVARIANT: `cdev` was just registered with `data` as its devdata.
++        Ok(Self {
++            cdev: NonNull::new(cdev).ok_or(EINVAL)?,
++            data,
++        })
++    }
++
++    /// The callbacks' data.
++    pub fn data(&self) -> &T {
++        &self.data
++    }
++
++    /// # Safety
++    ///
++    /// `cdev` must be a cooling device registered by a [`Registration<T>`].
++    unsafe fn data_of<'a>(cdev: *mut bindings::thermal_cooling_device) -> &'a T {
++        // SAFETY: By the type invariant, `devdata` points to a `T`, which the
++        // registration keeps alive while the thermal core can call back.
++        unsafe { &*(*cdev).devdata.cast::<T>() }
++    }
++
++    extern "C" fn get_max_state(
++        cdev: *mut bindings::thermal_cooling_device,
++        state: *mut c_ulong,
++    ) -> c_int {
++        from_result(|| {
++            // SAFETY: The thermal core calls back only with its registered device.
++            let max = unsafe { Self::data_of(cdev) }.max_state()?;
++            // SAFETY: `state` points to writable storage.
++            unsafe { *state = c_ulong::try_from(max)? };
++            Ok(0)
++        })
++    }
++
++    extern "C" fn get_cur_state(
++        cdev: *mut bindings::thermal_cooling_device,
++        state: *mut c_ulong,
++    ) -> c_int {
++        from_result(|| {
++            // SAFETY: The thermal core calls back only with its registered device.
++            let cur = unsafe { Self::data_of(cdev) }.cur_state()?;
++            // SAFETY: `state` points to writable storage.
++            unsafe { *state = c_ulong::try_from(cur)? };
++            Ok(0)
++        })
++    }
++
++    extern "C" fn set_cur_state(
++        cdev: *mut bindings::thermal_cooling_device,
++        state: c_ulong,
++    ) -> c_int {
++        from_result(|| {
++            // SAFETY: The thermal core calls back only with its registered device.
++            unsafe { Self::data_of(cdev) }.set_cur_state(state as u64)?;
++            Ok(0)
++        })
++    }
++
++    extern "C" fn get_requested_power(
++        cdev: *mut bindings::thermal_cooling_device,
++        power: *mut u32,
++    ) -> c_int {
++        from_result(|| {
++            // SAFETY: The thermal core calls back only with its registered device.
++            let requested = unsafe { Self::data_of(cdev) }.requested_power()?;
++            // SAFETY: `power` points to writable storage.
++            unsafe { *power = requested };
++            Ok(0)
++        })
++    }
++
++    extern "C" fn state2power(
++        cdev: *mut bindings::thermal_cooling_device,
++        state: c_ulong,
++        power: *mut u32,
++    ) -> c_int {
++        from_result(|| {
++            // SAFETY: The thermal core calls back only with its registered device.
++            let mw = unsafe { Self::data_of(cdev) }.state_to_power(state as u64)?;
++            // SAFETY: `power` points to writable storage.
++            unsafe { *power = mw };
++            Ok(0)
++        })
++    }
++
++    extern "C" fn power2state(
++        cdev: *mut bindings::thermal_cooling_device,
++        power: u32,
++        state: *mut c_ulong,
++    ) -> c_int {
++        from_result(|| {
++            // SAFETY: The thermal core calls back only with its registered device.
++            let least = unsafe { Self::data_of(cdev) }.power_to_state(power)?;
++            // SAFETY: `state` points to writable storage.
++            unsafe { *state = c_ulong::try_from(least)? };
++            Ok(0)
++        })
++    }
++}
++
++impl<T: CoolingDevice> Drop for Registration<T> {
++    fn drop(&mut self) {
++        // SAFETY: By the type invariant, `cdev` is registered. Once this
++        // returns, the thermal core makes no more callbacks, so `data` may
++        // drop after it.
++        unsafe { bindings::thermal_cooling_device_unregister(self.cdev.as_ptr()) };
++    }
++}

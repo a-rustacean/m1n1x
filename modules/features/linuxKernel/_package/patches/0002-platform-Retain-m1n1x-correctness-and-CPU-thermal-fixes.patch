@@ -1,0 +1,1842 @@
+From: Dilshad <a-rustacean@outlook.com>
+Date: Sat, 21 Nov 2026 12:00:00 +0000
+Subject: [PATCH] platform Retain m1n1x correctness and CPU thermal fixes
+
+Retain the downstream fixes and policy from commit 9b58444 on
+GravityLinux/linux c7e7b86aed0c4c052851e5c3b2c02088c0602f02.
+Hardware drivers and board enablement are supplied by Gravity, not
+re-exported here. Original authorship and sign-offs remain in that
+commit and the source files; this rebased integration has no new DCO
+sign-off and is not an upstream submission. See docs/SOURCES.md.
+
+---
+diff --git a/drivers/cpufreq/apple-soc-cpufreq.c b/drivers/cpufreq/apple-soc-cpufreq.c
+index c49fbd0..8e64f8f 100644
+--- a/drivers/cpufreq/apple-soc-cpufreq.c
++++ b/drivers/cpufreq/apple-soc-cpufreq.c
+@@ -16,11 +16,17 @@
+ #include <linux/err.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
++#include <linux/jiffies.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
++#include <linux/percpu.h>
+ #include <linux/pm_opp.h>
++#include <linux/pm_qos.h>
+ #include <linux/slab.h>
++#include <linux/soc/apple/pmp-report.h>
++#include <linux/timer.h>
++#include <linux/workqueue.h>
+ 
+ #define APPLE_DVFS_CMD				0x20
+ #define APPLE_DVFS_CMD_BUSY			BIT(31)
+@@ -69,10 +75,49 @@ struct apple_soc_cpufreq_info {
+ 	u64 ps1_shift;
+ };
+ 
++/*
++ * PMP's fast die-temperature effort caps the cluster at the fastest state
++ * whose power fits (255 - effort) / 255 of the fastest state's. Busy CPUs
++ * sample it every tick; while a cap holds, a work item samples it too, so
++ * the cap lifts on an idle cluster.
++ */
++#define APPLE_FAST_DIE_EFFORT_MAX	255
++#define APPLE_FAST_DIE_FALLBACK_EFFORT	170
++#define APPLE_FAST_DIE_WAIT_MS		100
++#define APPLE_FAST_DIE_WARN_MS		30000
++
++struct apple_fast_die;
++
++struct apple_fast_die_timer {
++	struct timer_list timer;
++	struct apple_fast_die *fd;
++};
++
++struct apple_fast_die {
++	struct cpufreq_policy *policy;
++	struct device_node *report;
++	unsigned int lane;
++	/* Power of each frequency table entry, in uW */
++	unsigned long *power;
++	unsigned long max_power;
++	unsigned int max_freq;
++	unsigned int min_freq;
++	/* Current QoS value, in kHz */
++	unsigned int limit;
++	struct freq_qos_request req;
++	struct delayed_work work;
++	unsigned long sampled;
++	unsigned long warn_at;
++	bool warned;
++};
++
++static DEFINE_PER_CPU(struct apple_fast_die_timer, apple_fast_die_timers);
++
+ struct apple_cpu_priv {
+ 	struct device *cpu_dev;
+ 	void __iomem *reg_base;
+ 	const struct apple_soc_cpufreq_info *info;
++	struct apple_fast_die *fast_die;
+ };
+ 
+ static struct cpufreq_driver apple_soc_cpufreq_driver;
+@@ -205,9 +250,184 @@ static unsigned int apple_soc_cpufreq_fast_switch(struct cpufreq_policy *policy,
+ 	return policy->freq_table[policy->cached_resolved_idx].frequency;
+ }
+ 
++static unsigned int apple_fast_die_limit(struct apple_fast_die *fd,
++					 unsigned int effort)
++{
++	struct cpufreq_frequency_table *pos;
++	unsigned long budget;
++	unsigned int limit = 0;
++	int i;
++
++	budget = fd->max_power * (APPLE_FAST_DIE_EFFORT_MAX - effort) /
++		 APPLE_FAST_DIE_EFFORT_MAX;
++
++	cpufreq_for_each_valid_entry_idx(pos, fd->policy->freq_table, i)
++		if (fd->power[i] <= budget && pos->frequency > limit)
++			limit = pos->frequency;
++
++	return limit ?: fd->min_freq;
++}
++
++static int apple_fast_die_sample(struct apple_fast_die *fd, unsigned int *limit)
++{
++	u8 effort;
++	int err;
++
++	err = apple_pmp_report_fast_die_effort(fd->report, fd->lane, &effort);
++	*limit = apple_fast_die_limit(fd, err ? APPLE_FAST_DIE_FALLBACK_EFFORT : effort);
++
++	return err;
++}
++
++static void apple_fast_die_tick(struct timer_list *t)
++{
++	struct apple_fast_die_timer *ft = timer_container_of(ft, t, timer);
++	struct apple_fast_die *fd = ft->fd;
++	unsigned long now = jiffies;
++	unsigned int limit;
++
++	if (xchg(&fd->sampled, now) != now) {
++		apple_fast_die_sample(fd, &limit);
++		if (limit != READ_ONCE(fd->limit))
++			mod_delayed_work(system_highpri_wq, &fd->work, 0);
++	}
++
++	mod_timer(t, now + 1);
++}
++
++static void apple_fast_die_work(struct work_struct *work)
++{
++	struct apple_fast_die *fd = container_of(to_delayed_work(work),
++						 struct apple_fast_die, work);
++	unsigned int limit;
++	int err;
++
++	err = apple_fast_die_sample(fd, &limit);
++	if (limit != fd->limit) {
++		freq_qos_update_request(&fd->req, limit);
++		WRITE_ONCE(fd->limit, limit);
++	}
++
++	if (err) {
++		if (!fd->warned && time_after(jiffies, fd->warn_at)) {
++			pr_warn("CPUs %*pbl: no PMP fast die-temperature limit (%d), held at %u kHz\n",
++				cpumask_pr_args(fd->policy->related_cpus), err, limit);
++			fd->warned = true;
++		}
++		queue_delayed_work(system_highpri_wq, &fd->work,
++				   msecs_to_jiffies(APPLE_FAST_DIE_WAIT_MS));
++	} else if (limit < fd->max_freq) {
++		queue_delayed_work(system_highpri_wq, &fd->work, 1);
++	}
++}
++
++static void apple_fast_die_exit(struct apple_fast_die *fd)
++{
++	int cpu;
++
++	for_each_possible_cpu(cpu) {
++		struct apple_fast_die_timer *ft = per_cpu_ptr(&apple_fast_die_timers, cpu);
++
++		if (ft->fd == fd) {
++			timer_shutdown_sync(&ft->timer);
++			ft->fd = NULL;
++		}
++	}
++	cancel_delayed_work_sync(&fd->work);
++	freq_qos_remove_request(&fd->req);
++	of_node_put(fd->report);
++	kfree(fd->power);
++	kfree(fd);
++}
++
++static int apple_fast_die_init(struct cpufreq_policy *policy,
++			       struct device_node *cluster)
++{
++	struct apple_cpu_priv *priv = policy->driver_data;
++	struct cpufreq_frequency_table *pos;
++	struct of_phandle_args args;
++	struct apple_fast_die *fd;
++	int ret, cpu, i, n = 0;
++
++	ret = of_parse_phandle_with_fixed_args(cluster, "apple,fast-die-effort",
++					       1, 0, &args);
++	if (ret)
++		return ret == -ENOENT ? 0 : ret;
++
++	fd = kzalloc_obj(*fd);
++	if (!fd) {
++		of_node_put(args.np);
++		return -ENOMEM;
++	}
++	fd->policy = policy;
++	fd->report = args.np;
++	fd->lane = args.args[0];
++	fd->min_freq = UINT_MAX;
++
++	cpufreq_for_each_entry(pos, policy->freq_table)
++		n++;
++	fd->power = kcalloc(n, sizeof(*fd->power), GFP_KERNEL);
++	if (!fd->power) {
++		ret = -ENOMEM;
++		goto out_free;
++	}
++
++	cpufreq_for_each_valid_entry_idx(pos, policy->freq_table, i) {
++		unsigned long rate = pos->frequency * 1000UL + 999;
++		struct dev_pm_opp *opp;
++
++		opp = dev_pm_opp_find_freq_floor(priv->cpu_dev, &rate);
++		if (IS_ERR(opp)) {
++			ret = PTR_ERR(opp);
++			goto out_free;
++		}
++		fd->power[i] = dev_pm_opp_get_power(opp);
++		dev_pm_opp_put(opp);
++
++		if (!fd->power[i]) {
++			ret = -ENODATA;
++			goto out_free;
++		}
++		fd->max_power = max(fd->max_power, fd->power[i]);
++		fd->max_freq = max(fd->max_freq, pos->frequency);
++		fd->min_freq = min(fd->min_freq, pos->frequency);
++	}
++
++	fd->limit = apple_fast_die_limit(fd, APPLE_FAST_DIE_FALLBACK_EFFORT);
++	ret = freq_qos_add_request(&policy->constraints, &fd->req, FREQ_QOS_MAX,
++				   fd->limit);
++	if (ret < 0)
++		goto out_free;
++
++	fd->warn_at = jiffies + msecs_to_jiffies(APPLE_FAST_DIE_WARN_MS);
++	INIT_DELAYED_WORK(&fd->work, apple_fast_die_work);
++	queue_delayed_work(system_highpri_wq, &fd->work, 0);
++
++	for_each_cpu(cpu, policy->cpus) {
++		struct apple_fast_die_timer *ft = per_cpu_ptr(&apple_fast_die_timers, cpu);
++
++		timer_setup(&ft->timer, apple_fast_die_tick,
++			    TIMER_DEFERRABLE | TIMER_PINNED);
++		ft->fd = fd;
++		ft->timer.expires = jiffies + 1;
++		if (cpu_online(cpu))
++			add_timer_on(&ft->timer, cpu);
++	}
++
++	priv->fast_die = fd;
++	return 0;
++
++out_free:
++	kfree(fd->power);
++	of_node_put(fd->report);
++	kfree(fd);
++	return ret;
++}
++
+ static int apple_soc_cpufreq_find_cluster(struct cpufreq_policy *policy,
+ 					  void __iomem **reg_base,
+-					  const struct apple_soc_cpufreq_info **info)
++					  const struct apple_soc_cpufreq_info **info,
++					  struct device_node **cluster)
+ {
+ 	struct of_phandle_args args;
+ 	const struct of_device_id *match;
+@@ -220,16 +440,20 @@ static int apple_soc_cpufreq_find_cluster(struct cpufreq_policy *policy,
+ 		return ret;
+ 
+ 	match = of_match_node(apple_soc_cpufreq_of_match, args.np);
+-	of_node_put(args.np);
+-	if (!match)
++	if (!match) {
++		of_node_put(args.np);
+ 		return -ENODEV;
++	}
+ 
+ 	*info = match->data;
+ 
+ 	*reg_base = of_iomap(args.np, 0);
+-	if (!*reg_base)
++	if (!*reg_base) {
++		of_node_put(args.np);
+ 		return -ENOMEM;
++	}
+ 
++	*cluster = args.np;
+ 	return 0;
+ }
+ 
+@@ -242,6 +466,7 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
+ 	struct apple_cpu_priv *priv;
+ 	const struct apple_soc_cpufreq_info *info;
+ 	struct cpufreq_frequency_table *freq_table;
++	struct device_node *cluster;
+ 
+ 	cpu_dev = get_cpu_device(policy->cpu);
+ 	if (!cpu_dev) {
+@@ -253,7 +478,7 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
+ 	if (!priv)
+ 		return -ENOMEM;
+ 
+-	ret = apple_soc_cpufreq_find_cluster(policy, &reg_base, &info);
++	ret = apple_soc_cpufreq_find_cluster(policy, &reg_base, &info, &cluster);
+ 	if (ret) {
+ 		dev_err(cpu_dev, "%s: failed to get cluster info: %d\n", __func__, ret);
+ 		goto out_free_priv;
+@@ -306,6 +531,11 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
+ 	policy->fast_switch_possible = true;
+ 	policy->suspend_freq = freq_table[0].frequency;
+ 
++	ret = apple_fast_die_init(policy, cluster);
++	if (ret)
++		dev_warn(cpu_dev, "no fast die-temperature limit: %d\n", ret);
++	of_node_put(cluster);
++
+ 	return 0;
+ 
+ out_free_cpufreq_table:
+@@ -314,6 +544,7 @@ out_free_table:
+ 	dev_pm_opp_of_cpumask_remove_table(policy->cpus);
+ out_iounmap:
+ 	iounmap(reg_base);
++	of_node_put(cluster);
+ out_free_priv:
+ 	kfree(priv);
+ 	return ret;
+@@ -323,6 +554,8 @@ static void apple_soc_cpufreq_exit(struct cpufreq_policy *policy)
+ {
+ 	struct apple_cpu_priv *priv = policy->driver_data;
+ 
++	if (priv->fast_die)
++		apple_fast_die_exit(priv->fast_die);
+ 	dev_pm_opp_free_cpufreq_table(priv->cpu_dev, &policy->freq_table);
+ 	dev_pm_opp_of_cpumask_remove_table(policy->cpus);
+ 	iounmap(priv->reg_base);
+diff --git a/drivers/cpuidle/cpuidle-apple.c b/drivers/cpuidle/cpuidle-apple.c
+index 3d2b804..cbf0dd0 100644
+--- a/drivers/cpuidle/cpuidle-apple.c
++++ b/drivers/cpuidle/cpuidle-apple.c
+@@ -57,7 +57,43 @@ asm(
+ 	".popsection\n"
+ );
+ 
++/*
++ * T8132: iBoot locks the power-down control on, so every wfi powers the core
++ * down and loses its registers. Writing the control raises an SError.
++ */
++asm(
++	".pushsection .cpuidle.text, \"ax\"\n"
++	".type apple_cpu_t8132_wfi, @function\n"
++	"apple_cpu_t8132_wfi:\n"
++		"str x30, [sp, #-16]!\n"
++		"stp x28, x29, [sp, #-16]!\n"
++		"stp x26, x27, [sp, #-16]!\n"
++		"stp x24, x25, [sp, #-16]!\n"
++		"stp x22, x23, [sp, #-16]!\n"
++		"stp x20, x21, [sp, #-16]!\n"
++		"stp x18, x19, [sp, #-16]!\n"
++
++	"1:\n"
++		"dsb sy\n"
++		"wfi\n"
++
++		"mrs x0, ISR_EL1\n"
++		"cbz x0, 1b\n"
++
++		"ldp x18, x19, [sp], #16\n"
++		"ldp x20, x21, [sp], #16\n"
++		"ldp x22, x23, [sp], #16\n"
++		"ldp x24, x25, [sp], #16\n"
++		"ldp x26, x27, [sp], #16\n"
++		"ldp x28, x29, [sp], #16\n"
++		"ldr x30, [sp], #16\n"
++
++		"ret\n"
++	".popsection\n"
++);
++
+ void apple_cpu_deep_wfi(void);
++void apple_cpu_t8132_wfi(void);
+ 
+ static __cpuidle int apple_enter_wfi(struct cpuidle_device *dev, struct cpuidle_driver *drv, int index)
+ {
+@@ -122,9 +158,57 @@ static struct cpuidle_driver apple_idle_driver = {
+ 	.state_count = STATE_COUNT,
+ };
+ 
++static __cpuidle int apple_enter_t8132(struct cpuidle_device *dev,
++				       struct cpuidle_driver *drv, int index)
++{
++	/* The power-down loses the FP state too; the CPU PM notifiers save it. */
++	if (cpu_pm_enter())
++		return -1;
++
++	ct_cpuidle_enter();
++	apple_cpu_t8132_wfi();
++	ct_cpuidle_exit();
++
++	cpu_pm_exit();
++
++	return index;
++}
++
++/*
++ * Every wfi powers the core down, so cpu_do_idle() waits in wfe instead,
++ * with interrupts unmasked; that rules it out for s2idle.
++ */
++static struct cpuidle_driver apple_t8132_idle_driver = {
++	.name = "apple_idle",
++	.owner = THIS_MODULE,
++	.states = {
++		{
++			.enter			= apple_enter_wfi,
++			.exit_latency		= 1,
++			.target_residency	= 1,
++			.power_usage		= UINT_MAX,
++			.name			= "WFE",
++			.desc			= "CPU waiting for an event",
++		},
++		{
++			.enter			= apple_enter_t8132,
++			.enter_s2idle		= apple_enter_t8132,
++			.exit_latency		= 10,
++			.target_residency	= 100,
++			.power_usage		= 0,
++			.name			= "CPU PD",
++			.desc			= "CPU powered down",
++			.flags			= CPUIDLE_FLAG_RCU_IDLE,
++		},
++	},
++	.state_count = 2,
++};
++
++static struct cpuidle_driver *apple_driver = &apple_idle_driver;
++
+ static int apple_cpuidle_probe(struct platform_device *pdev)
+ {
+-	return cpuidle_register(&apple_idle_driver, NULL);
++	return cpuidle_register(apple_driver, NULL);
+ }
+ 
+ static struct platform_driver apple_cpuidle_driver = {
+@@ -146,7 +230,9 @@ static int __init apple_cpuidle_init(void)
+ 	if (!of_machine_is_compatible("apple,arm-platform"))
+ 		return 0;
+ 
+-	if (!(of_machine_is_compatible("apple,t8103") ||
++	if (of_machine_is_compatible("apple,t8132"))
++		apple_driver = &apple_t8132_idle_driver;
++	else if (!(of_machine_is_compatible("apple,t8103") ||
+ 	      of_machine_is_compatible("apple,t8112") ||
+ 	      of_machine_is_compatible("apple,t8122") ||
+ 	      of_machine_is_compatible("apple,t6000") ||
+diff --git a/drivers/gpio/gpio-macsmc.c b/drivers/gpio/gpio-macsmc.c
+index 62107ef..60660a2 100644
+--- a/drivers/gpio/gpio-macsmc.c
++++ b/drivers/gpio/gpio-macsmc.c
+@@ -13,6 +13,8 @@
+ #include <linux/hex.h>
+ #include <linux/mfd/core.h>
+ #include <linux/mfd/macsmc.h>
++#include <linux/property.h>
++#include <linux/slab.h>
+ 
+ #define MAX_GPIO 64
+ 
+@@ -76,6 +78,9 @@ struct macsmc_gpio {
+ 
+ 	int first_index;
+ 	smc_key base_key;
++	DECLARE_BITMAP(templated, MAX_GPIO);
++	DECLARE_BITMAP(template_values, MAX_GPIO);
++	u32 templates[MAX_GPIO];
+ };
+ 
+ static int macsmc_gpio_nr(smc_key key)
+@@ -148,6 +153,9 @@ static int macsmc_gpio_get_direction(struct gpio_chip *gc, unsigned int offset)
+ 	u32 val;
+ 	int ret;
+ 
++	if (test_bit(offset, smcgp->templated))
++		return GPIO_LINE_DIRECTION_OUT;
++
+ 	/* First try reading the explicit pin mode register */
+ 	ret = apple_smc_rw_u32(smcgp->smc, key, CMD_PINMODE, &val);
+ 	if (!ret)
+@@ -168,6 +176,9 @@ static int macsmc_gpio_get(struct gpio_chip *gc, unsigned int offset)
+ 	u32 cmd, val;
+ 	int ret;
+ 
++	if (test_bit(offset, smcgp->templated))
++		return test_bit(offset, smcgp->template_values);
++
+ 	ret = macsmc_gpio_get_direction(gc, offset);
+ 	if (ret < 0)
+ 		return ret;
+@@ -188,17 +199,48 @@ static int macsmc_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
+ {
+ 	struct macsmc_gpio *smcgp = gpiochip_get_data(gc);
+ 	smc_key key = macsmc_gpio_key(smcgp->base_key, offset);
++	bool templated = test_bit(offset, smcgp->templated);
++	u32 cmd = templated ? smcgp->templates[offset] : CMD_OUTPUT;
+ 	int ret;
+ 
+-	value |= CMD_OUTPUT;
+-	ret = apple_smc_write_u32(smcgp->smc, key, CMD_OUTPUT | value);
++	ret = apple_smc_write_u32(smcgp->smc, key, cmd | value);
+ 	if (ret < 0)
+ 		dev_err(smcgp->dev, "GPIO set failed %p4ch = 0x%x\n",
+-			&key, value);
++			&key, cmd | value);
++	else if (templated)
++		assign_bit(offset, smcgp->template_values, value);
+ 
+ 	return ret < 0 ? ret : 0;
+ }
+ 
++static int macsmc_gpio_read_templates(struct macsmc_gpio *smcgp)
++{
++	const char *prop = "apple,output-templates";
++	int i, n, ret;
++
++	if (!device_property_present(smcgp->dev, prop))
++		return 0;
++	n = device_property_count_u32(smcgp->dev, prop);
++	if (n < 0)
++		return n;
++	if (!n || n % 2 || n > 2 * MAX_GPIO)
++		return dev_err_probe(smcgp->dev, -EINVAL, "bad %s\n", prop);
++	u32 *vals __free(kfree) = kcalloc(n, sizeof(*vals), GFP_KERNEL);
++	if (!vals)
++		return -ENOMEM;
++	ret = device_property_read_u32_array(smcgp->dev, prop, vals, n);
++	if (ret)
++		return ret;
++	for (i = 0; i < n; i += 2) {
++		u32 line = vals[i], template = vals[i + 1];
++		if (line >= MAX_GPIO || template & 0xffff)
++			return dev_err_probe(smcgp->dev, -EINVAL, "bad output template\n");
++		smcgp->templates[line] = template;
++		set_bit(line, smcgp->templated);
++	}
++	return 0;
++}
++
+ static int macsmc_gpio_init_valid_mask(struct gpio_chip *gc,
+ 				       unsigned long *valid_mask, unsigned int ngpios)
+ {
+@@ -253,6 +295,10 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
+ 	smcgp->smc = smc;
+ 	smcgp->base_key = data ? data->base_key : _SMC_KEY("gP\0\0");
+ 
++	ret = macsmc_gpio_read_templates(smcgp);
++	if (ret)
++		return ret;
++
+ 	smcgp->first_index = macsmc_gpio_find_first_gpio_index(smcgp);
+ 	if (smcgp->first_index < 0)
+ 		return smcgp->first_index;
+diff --git a/drivers/hid/dockchannel-hid/dockchannel-hid.c b/drivers/hid/dockchannel-hid/dockchannel-hid.c
+index 145dcdb..04958c5 100644
+--- a/drivers/hid/dockchannel-hid/dockchannel-hid.c
++++ b/drivers/hid/dockchannel-hid/dockchannel-hid.c
+@@ -911,7 +911,7 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t
+ 		case INIT_GPIO_REQUEST: {
+ 			struct dchid_gpio_request *req = data;
+ 
+-			if (sizeof(*req) > length)
++			if (sizeof(*req) > blk->length)
+ 				break;
+ 
+ 			if (iface->gpio_id) {
+@@ -931,7 +931,7 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t
+ 		case INIT_PRODUCT_NAME: {
+ 			char *product = data;
+ 
+-			if (product[blk->length - 1] != 0) {
++			if (!blk->length || product[blk->length - 1] != 0) {
+ 				dev_warn(dchid->dev, "Unterminated product name for %s\n",
+ 					 iface->name);
+ 			} else {
+diff --git a/drivers/irqchip/irq-apple-aic.c b/drivers/irqchip/irq-apple-aic.c
+index 445bed4..f81e887 100644
+--- a/drivers/irqchip/irq-apple-aic.c
++++ b/drivers/irqchip/irq-apple-aic.c
+@@ -261,6 +261,12 @@ struct aic_info {
+ 	/* Features */
+ 	bool fast_ipi;
+ 	bool local_fast_ipi;
++
++	/*
++	 * The EL2 guest timer FIQ enables and the vGIC maintenance
++	 * interrupt control must not be written (t8132).
++	 */
++	bool no_el2_sources;
+ };
+ 
+ static const struct aic_info aic1_info __initconst = {
+@@ -307,7 +313,21 @@ static const struct aic_info aic3_info __initconst = {
+ 	.local_fast_ipi = true,
+ };
+ 
++static const struct aic_info aic3_t8132_info __initconst = {
++	.version	= 3,
++
++	.irq_cfg	= AIC3_IRQ_CFG,
++
++	.fast_ipi	= true,
++	.local_fast_ipi = true,
++	.no_el2_sources = true,
++};
++
+ static const struct of_device_id aic_info_match[] = {
++	{
++		.compatible = "apple,t8132-aic3",
++		.data = &aic3_t8132_info,
++	},
+ 	{
+ 		.compatible = "apple,t8103-aic",
+ 		.data = &aic1_local_fipi_info,
+@@ -500,6 +520,9 @@ static unsigned long aic_fiq_get_idx(struct irq_data *d)
+ 
+ static void aic_fiq_set_mask(struct irq_data *d)
+ {
++	if (aic_irqc->info.no_el2_sources)
++		return;
++
+ 	/* Only the guest timers have real mask bits, unfortunately. */
+ 	switch (aic_fiq_get_idx(d)) {
+ 	case AIC_TMR_EL02_PHYS:
+@@ -517,6 +540,9 @@ static void aic_fiq_set_mask(struct irq_data *d)
+ 
+ static void aic_fiq_clear_mask(struct irq_data *d)
+ {
++	if (aic_irqc->info.no_el2_sources)
++		return;
++
+ 	switch (aic_fiq_get_idx(d)) {
+ 	case AIC_TMR_EL02_PHYS:
+ 		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, 0, VM_TMR_FIQ_ENABLE_P);
+@@ -869,7 +895,7 @@ static void aic_mask_cpu_fiq_sources(void)
+ 	sysreg_clear_set(cntv_ctl_el0, 0, ARCH_TIMER_CTRL_IT_MASK);
+ 
+ 	/* EL2-only (VHE mode) IRQ sources */
+-	if (is_kernel_in_hyp_mode()) {
++	if (is_kernel_in_hyp_mode() && !aic_irqc->info.no_el2_sources) {
+ 		/* Guest timers */
+ 		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2,
+ 				   VM_TMR_FIQ_ENABLE_V | VM_TMR_FIQ_ENABLE_P, 0);
+diff --git a/drivers/mfd/macsmc.c b/drivers/mfd/macsmc.c
+index 31540f6..d397c86 100644
+--- a/drivers/mfd/macsmc.c
++++ b/drivers/mfd/macsmc.c
+@@ -211,7 +211,10 @@ int apple_smc_get_key_info(struct apple_smc *smc, smc_key key, struct apple_smc_
+ 	u8 key_info[6];
+ 	int ret;
+ 
+-	ret = apple_smc_cmd(smc, SMC_MSG_GET_KEY_INFO, key, 0, 0, NULL);
++	/* Hold the lock until the reply is copied out of the shared buffer. */
++	guard(mutex)(&smc->mutex);
++
++	ret = apple_smc_cmd_locked(smc, SMC_MSG_GET_KEY_INFO, key, 0, 0, NULL);
+ 	if (ret >= 0 && info) {
+ 		memcpy_fromio(key_info, smc->shmem.iomem, sizeof(key_info));
+ 		info->size = key_info[0];
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
+index 5c0d665..fc5477f 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
+@@ -85,6 +85,14 @@
+ #define BRCMF_SCAN_UNASSOC_TIME		40
+ #define BRCMF_SCAN_PASSIVE_TIME		120
+ 
++/*
++ * E-Scan timeout. Per channel, the firmware dwells for up to
++ * BRCMF_SCAN_PASSIVE_TIME (P2P scans up to 200 ms) and, while associated,
++ * also returns to its own channel; allow twice the passive dwell.
++ */
++#define BRCMF_ESCAN_TIMEOUT_BASE_MS	2000
++#define BRCMF_ESCAN_TIMEOUT_CHANNEL_MS	(2 * BRCMF_SCAN_PASSIVE_TIME + 40)
++
+ #define BRCMF_ND_INFO_TIMEOUT		msecs_to_jiffies(2000)
+ 
+ #define BRCMF_PS_MAX_TIMEOUT_MS		2000
+@@ -1231,7 +1239,9 @@ brcmf_cfg80211_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
+ 
+ 	/* Arm scan timeout timer */
+ 	mod_timer(&cfg->escan_timeout,
+-		  jiffies + msecs_to_jiffies(BRCMF_ESCAN_TIMER_INTERVAL_MS));
++		  jiffies + msecs_to_jiffies(BRCMF_ESCAN_TIMEOUT_BASE_MS +
++					     request->n_channels *
++					     BRCMF_ESCAN_TIMEOUT_CHANNEL_MS));
+ 
+ 	return 0;
+ 
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.h b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.h
+index 0dac9a4..ec72519 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.h
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.h
+@@ -47,7 +47,6 @@
+  * problematic on some systems and should be avoided.
+  */
+ #define BRCMF_ESCAN_BUF_SIZE		65000
+-#define BRCMF_ESCAN_TIMER_INTERVAL_MS	10000	/* E-Scan timeout */
+ 
+ #define WL_ESCAN_ACTION_START		1
+ #define WL_ESCAN_ACTION_CONTINUE	2
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/common.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/common.c
+index e3a9ca5..cfe0038 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/common.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/common.c
+@@ -96,7 +96,10 @@ void brcmf_c_set_joinpref_default(struct brcmf_if *ifp)
+ 	join_pref_params[1].band = 0;
+ 	err = brcmf_fil_iovar_data_set(ifp, "join_pref", join_pref_params,
+ 				       sizeof(join_pref_params));
+-	if (err)
++	/* Firmware without the RSSI delta preference keeps its own. */
++	if (err == -EBADE)
++		brcmf_dbg(INFO, "Firmware refused the default join_pref\n");
++	else if (err)
+ 		bphy_err(drvr, "Set join_pref error (%d)\n", err);
+ }
+ 
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+index c81ab75..517f0ac 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -75,6 +75,7 @@ BRCMF_FW_CLM_DEF(4378B3, "brcmfmac4378b3-pcie");
+ BRCMF_FW_CLM_DEF(4387C2, "brcmfmac4387c2-pcie");
+ BRCMF_FW_CLM_DEF(4388B0, "brcmfmac4388b0-pcie");
+ BRCMF_FW_CLM_DEF(4388C0, "brcmfmac4388c0-pcie");
++BRCMF_FW_CLM_DEF(4388C2, "brcmfmac4388c2-pcie");
+ BRCMF_FW_CLM_DEF(54591, "brcmfmac54591-pcie");
+ 
+ /* firmware config files */
+@@ -117,6 +118,7 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
+ 	BRCMF_FW_ENTRY(BRCM_CC_4378_CHIP_ID, 0xFFFFFFE0, 4378B3), /* revision ID 5 */
+ 	BRCMF_FW_ENTRY(BRCM_CC_4387_CHIP_ID, 0xFFFFFFFF, 4387C2), /* revision ID 7 */
+ 	BRCMF_FW_ENTRY(BRCM_CC_4388_CHIP_ID, 0x0000000F, 4388B0),
++	BRCMF_FW_ENTRY(BRCM_CC_4388_CHIP_ID, BIT(6), 4388C2), /* revision ID 6 */
+ 	BRCMF_FW_ENTRY(BRCM_CC_4388_CHIP_ID, 0xFFFFFFF0, 4388C0), /* revision ID 4 */
+ };
+ 
+diff --git a/drivers/perf/apple_m1_cpu_pmu.c b/drivers/perf/apple_m1_cpu_pmu.c
+index 81b6f1a..1594b17 100644
+--- a/drivers/perf/apple_m1_cpu_pmu.c
++++ b/drivers/perf/apple_m1_cpu_pmu.c
+@@ -22,6 +22,7 @@
+ #define M1_PMU_NR_COUNTERS		10
+ 
+ #define M1_PMU_CFG_EVENT		GENMASK(7, 0)
++#define M3_PMU_CFG_EVENT		GENMASK(15, 0)
+ 
+ #define ANY_BUT_0_1			GENMASK(9, 2)
+ #define ONLY_2_TO_7			GENMASK(7, 2)
+@@ -43,9 +44,6 @@
+  * moment, we don't really need to distinguish between the two because we
+  * know next to nothing about the events themselves, and we already have
+  * per cpu-type PMU abstractions.
+- *
+- * If we eventually find out that the events are different across
+- * implementations, we'll have to introduce per cpu-type tables.
+  */
+ enum m1_pmu_events {
+ 	M1_PMU_PERFCTR_RETIRE_UOP				= 0x1,
+@@ -125,6 +123,199 @@ enum m1_pmu_events {
+ 	M1_PMU_CFG_COUNT_GUEST					= BIT(11),
+ };
+ 
++enum m3_pmu_events {
++	M3_PMU_PERFCTR_RETIRE_UOP				= 0x1,
++	M3_PMU_PERFCTR_CORE_ACTIVE_CYCLE			= 0x2,
++	M3_PMU_PERFCTR_FLUSH_RESTART_OTHER_NONSPEC		= 0x84,
++	M3_PMU_PERFCTR_INST_ALL					= 0x8c,
++	M3_PMU_PERFCTR_INST_BRANCH				= 0x8d,
++	M3_PMU_PERFCTR_INST_BRANCH_CALL				= 0x8e,
++	M3_PMU_PERFCTR_INST_BRANCH_RET				= 0x8f,
++	M3_PMU_PERFCTR_INST_BRANCH_TAKEN			= 0x90,
++	M3_PMU_PERFCTR_INST_BRANCH_INDIR			= 0x93,
++	M3_PMU_PERFCTR_INST_INT_LD				= 0x95,
++	M3_PMU_PERFCTR_INST_INT_ST				= 0x96,
++	M3_PMU_PERFCTR_INST_INT_ALU				= 0x97,
++	M3_PMU_PERFCTR_INST_SIMD_LD				= 0x98,
++	M3_PMU_PERFCTR_INST_SIMD_ST				= 0x99,
++	M3_PMU_PERFCTR_INST_SIMD_ALU				= 0x9a,
++	M3_PMU_PERFCTR_INST_LDST				= 0x9b,
++	M3_PMU_PERFCTR_INST_BARRIER				= 0x9c,
++	M3_PMU_PERFCTR_INST_SIMD_ALU_VEC			= 0x9f,
++	M3_PMU_PERFCTR_L1D_CACHE_MISS_LD_NONSPEC		= 0xbf,
++	M3_PMU_PERFCTR_L1D_CACHE_MISS_ST_NONSPEC		= 0xc0,
++	M3_PMU_PERFCTR_L1D_TLB_MISS_NONSPEC			= 0xc1,
++	M3_PMU_PERFCTR_ST_MEM_ORDER_VIOL_LD_NONSPEC		= 0xc4,
++	M3_PMU_PERFCTR_BRANCH_COND_MISPRED_NONSPEC		= 0xc5,
++	M3_PMU_PERFCTR_BRANCH_INDIR_MISPRED_NONSPEC		= 0xc6,
++	M3_PMU_PERFCTR_BRANCH_RET_INDIR_MISPRED_NONSPEC		= 0xc8,
++	M3_PMU_PERFCTR_BRANCH_CALL_INDIR_MISPRED_NONSPEC	= 0xca,
++	M3_PMU_PERFCTR_BRANCH_MISPRED_NONSPEC			= 0xcb,
++	M3_PMU_PERFCTR_MAP_DISPATCH_BUBBLE_IC			= 0x182,
++	M3_PMU_PERFCTR_MAP_DISPATCH_BUBBLE_ITLB			= 0x183,
++	M3_PMU_PERFCTR_DECODE_UOP				= 0x186,
++	M3_PMU_PERFCTR_L1I_TLB_MISS_DEMAND			= 0x1d4,
++	M3_PMU_PERFCTR_MAP_DISPATCH_BUBBLE			= 0x1d6,
++	M3_PMU_PERFCTR_L1I_CACHE_MISS_DEMAND			= 0x1db,
++	M3_PMU_PERFCTR_FETCH_RESTART				= 0x1de,
++	M3_PMU_PERFCTR_MAP_UOP					= 0x269,
++	M3_PMU_PERFCTR_INTERRUPT_PENDING			= 0x26c,
++	M3_PMU_PERFCTR_MAP_STALL_DISPATCH			= 0x270,
++	M3_PMU_PERFCTR_MAP_REWIND				= 0x275,
++	M3_PMU_PERFCTR_MAP_STALL				= 0x276,
++	M3_PMU_PERFCTR_MAP_INT_UOP				= 0x27c,
++	M3_PMU_PERFCTR_MAP_LDST_UOP				= 0x27d,
++	M3_PMU_PERFCTR_MAP_SIMD_UOP				= 0x27e,
++	M3_PMU_PERFCTR_SCHEDULE_UOP_ANY				= 0x283,
++	M3_PMU_PERFCTR_LDST_UNIT_OLD_L1D_CACHE_MISS		= 0x290,
++	M3_PMU_PERFCTR_LDST_UNIT_WAITING_OLD_L1D_CACHE_MISS	= 0x291,
++	M3_PMU_PERFCTR_SCHEDULE_EMPTY				= 0x351,
++	M3_PMU_PERFCTR_L1I_TLB_FILL				= 0x404,
++	M3_PMU_PERFCTR_L1D_TLB_FILL				= 0x405,
++	M3_PMU_PERFCTR_MMU_TABLE_WALK_INSTRUCTION		= 0x407,
++	M3_PMU_PERFCTR_MMU_TABLE_WALK_DATA			= 0x408,
++	M3_PMU_PERFCTR_L2_TLB_MISS_INSTRUCTION			= 0x40a,
++	M3_PMU_PERFCTR_L2_TLB_MISS_DATA				= 0x40b,
++	M3_PMU_PERFCTR_L1D_TLB_ACCESS				= 0x5a0,
++	M3_PMU_PERFCTR_L1D_TLB_MISS				= 0x5a1,
++	M3_PMU_PERFCTR_L1D_CACHE_MISS_ST			= 0x5a2,
++	M3_PMU_PERFCTR_L1D_CACHE_MISS_LD			= 0x5a3,
++	M3_PMU_PERFCTR_LD_UNIT_UOP				= 0x5a6,
++	M3_PMU_PERFCTR_ST_UNIT_UOP				= 0x5a7,
++	M3_PMU_PERFCTR_L1D_CACHE_WRITEBACK			= 0x5a8,
++	M3_PMU_PERFCTR_LDST_X64_UOP				= 0x5b1,
++	M3_PMU_PERFCTR_LDST_XPG_UOP				= 0x5b2,
++	M3_PMU_PERFCTR_ATOMIC_OR_EXCLUSIVE_SUCC			= 0x5b3,
++	M3_PMU_PERFCTR_ATOMIC_OR_EXCLUSIVE_FAIL			= 0x5b4,
++	M3_PMU_PERFCTR_ST_NT_UOP				= 0x5e5,
++	M3_PMU_PERFCTR_LD_NT_UOP				= 0x5e6,
++	M3_PMU_PERFCTR_LAST					= M3_PMU_CFG_EVENT,
++
++	/*
++	 * From this point onwards, these are not actual HW events,
++	 * but attributes that get stored in hw->config_base.
++	 */
++	M3_PMU_CFG_COUNT_USER					= BIT(16),
++	M3_PMU_CFG_COUNT_KERNEL					= BIT(17),
++	M3_PMU_CFG_COUNT_HOST					= BIT(18),
++	M3_PMU_CFG_COUNT_GUEST					= BIT(19),
++};
++
++enum m4_pmu_events {
++	M4_PMU_PERFCTR_ARM_L1D_CACHE_REFILL				= 0x03,
++	M4_PMU_PERFCTR_ARM_L1D_CACHE					= 0x04,
++	M4_PMU_PERFCTR_INST_ALL						= 0x08,
++	M4_PMU_PERFCTR_ARM_BR_MIS_PRED					= 0x10,
++	M4_PMU_PERFCTR_CORE_ACTIVE_CYCLE				= 0x11,
++	M4_PMU_PERFCTR_ARM_BR_PRED					= 0x12,
++	M4_PMU_PERFCTR_INST_BRANCH					= 0x21,
++	M4_PMU_PERFCTR_BRANCH_MISPRED_NONSPEC				= 0x22,
++	M4_PMU_PERFCTR_ARM_STALL_FRONTEND				= 0x23,
++	M4_PMU_PERFCTR_ARM_STALL_BACKEND				= 0x24,
++	M4_PMU_PERFCTR_ARM_L1D_CACHE_LMISS_RD				= 0x39,
++	M4_PMU_PERFCTR_RETIRE_UOP					= 0x3a,
++	M4_PMU_PERFCTR_MAP_UOP						= 0x3b,
++	M4_PMU_PERFCTR_ARM_STALL					= 0x3c,
++	M4_PMU_PERFCTR_ARM_STALL_SLOT_BACKEND				= 0x3d,
++	M4_PMU_PERFCTR_ARM_STALL_SLOT_FRONTEND				= 0x3e,
++	M4_PMU_PERFCTR_ARM_STALL_SLOT					= 0x3f,
++	M4_PMU_PERFCTR_ARM_L1D_CACHE_RD					= 0x40,
++	M4_PMU_PERFCTR_MAP_DISPATCH_BUBBLE_IC				= 0x182,
++	M4_PMU_PERFCTR_MAP_DISPATCH_BUBBLE_ITLB				= 0x183,
++	M4_PMU_PERFCTR_DECODE_UOP					= 0x186,
++	M4_PMU_PERFCTR_L1I_TLB_MISS_DEMAND				= 0x1d4,
++	M4_PMU_PERFCTR_MAP_DISPATCH_BUBBLE				= 0x1d6,
++	M4_PMU_PERFCTR_FETCH_RESTART					= 0x1de,
++	M4_PMU_PERFCTR_MAP_DISPATCH_BUBBLE_SLOT				= 0x1e1,
++	M4_PMU_PERFCTR_INTERRUPT_PENDING				= 0x26c,
++	M4_PMU_PERFCTR_MAP_STALL_DISPATCH				= 0x270,
++	M4_PMU_PERFCTR_MAP_REWIND					= 0x275,
++	M4_PMU_PERFCTR_MAP_STALL					= 0x276,
++	M4_PMU_PERFCTR_MAP_INT_UOP					= 0x27c,
++	M4_PMU_PERFCTR_MAP_LDST_UOP					= 0x27d,
++	M4_PMU_PERFCTR_MAP_SIMD_UOP					= 0x27e,
++	M4_PMU_PERFCTR_SCHEDULE_UOP_ANY					= 0x283,
++	M4_PMU_PERFCTR_MAP_INT_SME_UOP					= 0x285,
++	M4_PMU_PERFCTR_SME_ENGINE_SM_ENABLE				= 0x286,
++	M4_PMU_PERFCTR_SME_ENGINE_SM_ZA_ENABLE				= 0x287,
++	M4_PMU_PERFCTR_SME_ENGINE_ZA_ENABLED_SM_DISABLED		= 0x288,
++	M4_PMU_PERFCTR_LDST_UNIT_WAITING_SME_ENGINE_INST_QUEUE_FULL	= 0x28c,
++	M4_PMU_PERFCTR_SCHEDULE_WAITING_SME_ENGINE_REG_DATA		= 0x28e,
++	M4_PMU_PERFCTR_LDST_UNIT_WAITING_SME_ENGINE_MEM_DATA		= 0x28f,
++	M4_PMU_PERFCTR_LDST_UNIT_OLD_L1D_CACHE_MISS			= 0x290,
++	M4_PMU_PERFCTR_LDST_UNIT_WAITING_OLD_L1D_CACHE_MISS		= 0x291,
++	M4_PMU_PERFCTR_LD_UNIT_WAITING_YOUNG_L1D_CACHE_MISS		= 0x294,
++	M4_PMU_PERFCTR_MAP_RECOVERY					= 0x2ad,
++	M4_PMU_PERFCTR_MAP_STALL_NONRECOVERY				= 0x2ae,
++	M4_PMU_PERFCTR_SCHEDULE_EMPTY					= 0x351,
++	M4_PMU_PERFCTR_L1I_TLB_FILL					= 0x404,
++	M4_PMU_PERFCTR_L1D_TLB_FILL					= 0x405,
++	M4_PMU_PERFCTR_MMU_TABLE_WALK_INSTRUCTION			= 0x407,
++	M4_PMU_PERFCTR_MMU_TABLE_WALK_DATA				= 0x408,
++	M4_PMU_PERFCTR_L2_TLB_MISS_INSTRUCTION				= 0x40a,
++	M4_PMU_PERFCTR_L2_TLB_MISS_DATA					= 0x40b,
++	M4_PMU_PERFCTR_LDST_SME_XPG_UOP					= 0x508,
++	M4_PMU_PERFCTR_INST_SME_ENGINE_PACKING_FUSED			= 0x529,
++	M4_PMU_PERFCTR_LD_BLOCKED_BY_SME_LDST				= 0x52c,
++	M4_PMU_PERFCTR_ST_BARRIER_BLOCKED_BY_SME_LDST			= 0x52e,
++	M4_PMU_PERFCTR_LD_SME_NT_UOP					= 0x573,
++	M4_PMU_PERFCTR_ST_SME_NT_UOP					= 0x574,
++	M4_PMU_PERFCTR_LD_SME_NORMAL_UOP				= 0x575,
++	M4_PMU_PERFCTR_ST_SME_NORMAL_UOP				= 0x576,
++	M4_PMU_PERFCTR_LDST_SME_PRED_INACTIVE				= 0x577,
++	M4_PMU_PERFCTR_L1D_TLB_ACCESS					= 0x5a0,
++	M4_PMU_PERFCTR_L1D_TLB_MISS					= 0x5a1,
++	M4_PMU_PERFCTR_L1D_CACHE_MISS_ST				= 0x5a2,
++	M4_PMU_PERFCTR_L1D_CACHE_MISS_LD				= 0x5a3,
++	M4_PMU_PERFCTR_LD_UNIT_UOP					= 0x5a6,
++	M4_PMU_PERFCTR_ST_UNIT_UOP					= 0x5a7,
++	M4_PMU_PERFCTR_L1D_CACHE_WRITEBACK				= 0x5a8,
++	M4_PMU_PERFCTR_LDST_X64_UOP					= 0x5b1,
++	M4_PMU_PERFCTR_LDST_XPG_UOP					= 0x5b2,
++	M4_PMU_PERFCTR_ATOMIC_OR_EXCLUSIVE_SUCC				= 0x5b3,
++	M4_PMU_PERFCTR_ATOMIC_OR_EXCLUSIVE_FAIL				= 0x5b4,
++	M4_PMU_PERFCTR_ST_NT_UOP					= 0x5e5,
++	M4_PMU_PERFCTR_LD_NT_UOP					= 0x5e6,
++	M4_PMU_PERFCTR_FLUSH_RESTART_OTHER_NONSPEC			= 0x884,
++	M4_PMU_PERFCTR_INST_BRANCH_CALL					= 0x88e,
++	M4_PMU_PERFCTR_INST_BRANCH_RET					= 0x88f,
++	M4_PMU_PERFCTR_INST_BRANCH_TAKEN				= 0x890,
++	M4_PMU_PERFCTR_INST_BRANCH_INDIR				= 0x893,
++	M4_PMU_PERFCTR_INST_BRANCH_COND					= 0x894,
++	M4_PMU_PERFCTR_INST_INT_LD					= 0x895,
++	M4_PMU_PERFCTR_INST_INT_ST					= 0x896,
++	M4_PMU_PERFCTR_INST_INT_ALU					= 0x897,
++	M4_PMU_PERFCTR_INST_SIMD_LD					= 0x898,
++	M4_PMU_PERFCTR_INST_SIMD_ST					= 0x899,
++	M4_PMU_PERFCTR_INST_SIMD_ALU					= 0x89a,
++	M4_PMU_PERFCTR_INST_LDST					= 0x89b,
++	M4_PMU_PERFCTR_INST_BARRIER					= 0x89c,
++	M4_PMU_PERFCTR_INST_SIMD_ALU_VEC				= 0x89f,
++	M4_PMU_PERFCTR_INST_SME_ENGINE_SCALARFP				= 0x8a0,
++	M4_PMU_PERFCTR_INST_SME_ENGINE_LD				= 0x8a1,
++	M4_PMU_PERFCTR_INST_SME_ENGINE_ST				= 0x8a2,
++	M4_PMU_PERFCTR_INST_SME_ENGINE_ALU				= 0x8a3,
++	M4_PMU_PERFCTR_L1D_CACHE_MISS_LD_NONSPEC			= 0x8bf,
++	M4_PMU_PERFCTR_L1D_CACHE_MISS_ST_NONSPEC			= 0x8c0,
++	M4_PMU_PERFCTR_L1D_TLB_MISS_NONSPEC				= 0x8c1,
++	M4_PMU_PERFCTR_ST_MEM_ORDER_VIOL_LD_NONSPEC			= 0x8c4,
++	M4_PMU_PERFCTR_BRANCH_COND_MISPRED_NONSPEC			= 0x8c5,
++	M4_PMU_PERFCTR_BRANCH_INDIR_MISPRED_NONSPEC			= 0x8c6,
++	M4_PMU_PERFCTR_BRANCH_RET_INDIR_MISPRED_NONSPEC			= 0x8c8,
++	M4_PMU_PERFCTR_BRANCH_CALL_INDIR_MISPRED_NONSPEC		= 0x8ca,
++	M4_PMU_PERFCTR_L1I_CACHE_MISS_DEMAND				= 0x4006,
++	M4_PMU_PERFCTR_LAST						= M3_PMU_CFG_EVENT,
++
++	/*
++	 * From this point onwards, these are not actual HW events,
++	 * but attributes that get stored in hw->config_base.
++	 */
++	M4_PMU_CFG_COUNT_USER						= BIT(16),
++	M4_PMU_CFG_COUNT_KERNEL						= BIT(17),
++	M4_PMU_CFG_COUNT_HOST						= BIT(18),
++	M4_PMU_CFG_COUNT_GUEST						= BIT(19),
++};
++
+ /*
+  * Per-event affinity table. Most events can be installed on counter
+  * 2-9, but there are a number of exceptions. Note that this table
+@@ -167,7 +358,75 @@ static const u16 m1_pmu_event_affinity[M1_PMU_PERFCTR_LAST + 1] = {
+ 	[M1_PMU_PERFCTR_UNKNOWN_fd]				= ONLY_2_4_6,
+ };
+ 
+-static const unsigned m1_pmu_perf_map[PERF_COUNT_HW_MAX] = {
++struct event_affinity_16 {
++	u16 event_code;
++	u16 affinity;
++};
++
++static const struct event_affinity_16 m3_pmu_event_affinity[] = {
++	{ M3_PMU_PERFCTR_RETIRE_UOP,				BIT(7)			},
++	{ M3_PMU_PERFCTR_CORE_ACTIVE_CYCLE,			ANY_BUT_0_1 | BIT(0)	},
++	{ M3_PMU_PERFCTR_INST_ALL,				BIT(7) | BIT(1)		},
++	{ M3_PMU_PERFCTR_INST_BRANCH,				ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_INST_BRANCH_CALL,			ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_INST_BRANCH_RET,			ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_INST_BRANCH_TAKEN,			ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_INST_BRANCH_INDIR,			ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_INST_INT_LD,				ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_INST_INT_ST,				ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_INST_INT_ALU,				BIT(7)			},
++	{ M3_PMU_PERFCTR_INST_SIMD_LD,				ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_INST_SIMD_ST,				ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_INST_SIMD_ALU,				BIT(7)			},
++	{ M3_PMU_PERFCTR_INST_LDST,				BIT(7)			},
++	{ M3_PMU_PERFCTR_INST_BARRIER,				ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_INST_SIMD_ALU_VEC,			BIT(7)			},
++	{ M3_PMU_PERFCTR_L1D_CACHE_MISS_LD_NONSPEC,		ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_L1D_CACHE_MISS_ST_NONSPEC,		ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_L1D_TLB_MISS_NONSPEC,			ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_ST_MEM_ORDER_VIOL_LD_NONSPEC,		ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_BRANCH_COND_MISPRED_NONSPEC,		ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_BRANCH_INDIR_MISPRED_NONSPEC,		ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_BRANCH_RET_INDIR_MISPRED_NONSPEC,	ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_BRANCH_CALL_INDIR_MISPRED_NONSPEC,	ONLY_5_6_7		},
++	{ M3_PMU_PERFCTR_BRANCH_MISPRED_NONSPEC,		ONLY_5_6_7		},
++};
++
++static const struct event_affinity_16 m4_pmu_event_affinity[] = {
++	{ M4_PMU_PERFCTR_INST_ALL,				ONLY_2_TO_7 | BIT(1)	},
++	{ M4_PMU_PERFCTR_CORE_ACTIVE_CYCLE,			ANY_BUT_0_1 | BIT(0)	},
++	{ M4_PMU_PERFCTR_INST_BRANCH,				ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_BRANCH_MISPRED_NONSPEC,		ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_RETIRE_UOP,				ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_INST_BRANCH_CALL,			ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_INST_BRANCH_RET,			ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_INST_BRANCH_TAKEN,			ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_INST_BRANCH_INDIR,			ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_INST_BRANCH_COND,			ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_INST_INT_LD,				ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_INST_INT_ST,				ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_INST_INT_ALU,				BIT(7)			},
++	{ M4_PMU_PERFCTR_INST_SIMD_LD,				ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_INST_SIMD_ST,				ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_INST_SIMD_ALU,				BIT(7)			},
++	{ M4_PMU_PERFCTR_INST_LDST,				BIT(7)			},
++	{ M4_PMU_PERFCTR_INST_BARRIER,				ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_INST_SIMD_ALU_VEC,			BIT(7)			},
++	{ M4_PMU_PERFCTR_INST_SME_ENGINE_SCALARFP,		ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_INST_SME_ENGINE_LD,			ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_INST_SME_ENGINE_ST,			ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_INST_SME_ENGINE_ALU,			ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_L1D_CACHE_MISS_LD_NONSPEC,		ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_L1D_CACHE_MISS_ST_NONSPEC,		ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_L1D_TLB_MISS_NONSPEC,			ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_ST_MEM_ORDER_VIOL_LD_NONSPEC,		ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_BRANCH_COND_MISPRED_NONSPEC,		ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_BRANCH_INDIR_MISPRED_NONSPEC,		ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_BRANCH_RET_INDIR_MISPRED_NONSPEC,	ONLY_2_TO_7		},
++	{ M4_PMU_PERFCTR_BRANCH_CALL_INDIR_MISPRED_NONSPEC,	ONLY_2_TO_7		},
++};
++
++static const unsigned int m1_pmu_perf_map[PERF_COUNT_HW_MAX] = {
+ 	PERF_MAP_ALL_UNSUPPORTED,
+ 	[PERF_COUNT_HW_CPU_CYCLES]		= M1_PMU_PERFCTR_CORE_ACTIVE_CYCLE,
+ 	[PERF_COUNT_HW_INSTRUCTIONS]		= M1_PMU_PERFCTR_INST_ALL,
+@@ -175,9 +434,31 @@ static const unsigned m1_pmu_perf_map[PERF_COUNT_HW_MAX] = {
+ 	[PERF_COUNT_HW_BRANCH_MISSES]		= M1_PMU_PERFCTR_BRANCH_MISPRED_NONSPEC,
+ };
+ 
++static const unsigned int m3_pmu_perf_map[PERF_COUNT_HW_MAX] = {
++	PERF_MAP_ALL_UNSUPPORTED,
++	[PERF_COUNT_HW_CPU_CYCLES]		= M3_PMU_PERFCTR_CORE_ACTIVE_CYCLE,
++	[PERF_COUNT_HW_INSTRUCTIONS]		= M3_PMU_PERFCTR_INST_ALL,
++	[PERF_COUNT_HW_BRANCH_INSTRUCTIONS]	= M3_PMU_PERFCTR_INST_BRANCH,
++	[PERF_COUNT_HW_BRANCH_MISSES]		= M3_PMU_PERFCTR_BRANCH_MISPRED_NONSPEC,
++};
++
++static const unsigned int m4_pmu_perf_map[PERF_COUNT_HW_MAX] = {
++	PERF_MAP_ALL_UNSUPPORTED,
++	[PERF_COUNT_HW_CPU_CYCLES]		= M4_PMU_PERFCTR_CORE_ACTIVE_CYCLE,
++	[PERF_COUNT_HW_INSTRUCTIONS]		= M4_PMU_PERFCTR_INST_ALL,
++	[PERF_COUNT_HW_BRANCH_INSTRUCTIONS]	= M4_PMU_PERFCTR_INST_BRANCH,
++	[PERF_COUNT_HW_BRANCH_MISSES]		= M4_PMU_PERFCTR_BRANCH_MISPRED_NONSPEC,
++};
++
+ #define M1_PMUV3_EVENT_MAP(pmuv3_event, m1_event)				\
+ 	[ARMV8_PMUV3_PERFCTR_##pmuv3_event]	= M1_PMU_PERFCTR_##m1_event
+ 
++#define M3_PMUV3_EVENT_MAP(pmuv3_event, m3_event)				\
++	[ARMV8_PMUV3_PERFCTR_##pmuv3_event]	= M3_PMU_PERFCTR_##m3_event
++
++#define M4_PMUV3_EVENT_MAP(pmuv3_event, m4_event)				\
++	[ARMV8_PMUV3_PERFCTR_##pmuv3_event]	= M4_PMU_PERFCTR_##m4_event
++
+ static const u16 m1_pmu_pmceid_map[ARMV8_PMUV3_MAX_COMMON_EVENTS] = {
+ 	[0 ... ARMV8_PMUV3_MAX_COMMON_EVENTS - 1]	= HW_OP_UNSUPPORTED,
+ 	M1_PMUV3_EVENT_MAP(INST_RETIRED,	INST_ALL),
+@@ -186,6 +467,22 @@ static const u16 m1_pmu_pmceid_map[ARMV8_PMUV3_MAX_COMMON_EVENTS] = {
+ 	M1_PMUV3_EVENT_MAP(BR_MIS_PRED_RETIRED,	BRANCH_MISPRED_NONSPEC),
+ };
+ 
++static const u16 m3_pmu_pmceid_map[ARMV8_PMUV3_MAX_COMMON_EVENTS] = {
++	[0 ... ARMV8_PMUV3_MAX_COMMON_EVENTS - 1]	= HW_OP_UNSUPPORTED,
++	M3_PMUV3_EVENT_MAP(INST_RETIRED,	INST_ALL),
++	M3_PMUV3_EVENT_MAP(CPU_CYCLES,		CORE_ACTIVE_CYCLE),
++	M3_PMUV3_EVENT_MAP(BR_RETIRED,		INST_BRANCH),
++	M3_PMUV3_EVENT_MAP(BR_MIS_PRED_RETIRED,	BRANCH_MISPRED_NONSPEC),
++};
++
++static const u16 m4_pmu_pmceid_map[ARMV8_PMUV3_MAX_COMMON_EVENTS] = {
++	[0 ... ARMV8_PMUV3_MAX_COMMON_EVENTS - 1]	= HW_OP_UNSUPPORTED,
++	M4_PMUV3_EVENT_MAP(INST_RETIRED,	INST_ALL),
++	M4_PMUV3_EVENT_MAP(CPU_CYCLES,		CORE_ACTIVE_CYCLE),
++	M4_PMUV3_EVENT_MAP(BR_RETIRED,		INST_BRANCH),
++	M4_PMUV3_EVENT_MAP(BR_MIS_PRED_RETIRED,	BRANCH_MISPRED_NONSPEC),
++};
++
+ /* sysfs definitions */
+ static ssize_t m1_pmu_events_sysfs_show(struct device *dev,
+ 					struct device_attribute *attr,
+@@ -198,30 +495,83 @@ static ssize_t m1_pmu_events_sysfs_show(struct device *dev,
+ 	return sprintf(page, "event=0x%04llx\n", pmu_attr->id);
+ }
+ 
++static ssize_t m3_pmu_events_sysfs_show(struct device *dev,
++					struct device_attribute *attr,
++					char *page)
++{
++	struct perf_pmu_events_attr *pmu_attr;
++
++	pmu_attr = container_of(attr, struct perf_pmu_events_attr, attr);
++
++	return sprintf(page, "event=0x%06llx\n", pmu_attr->id);
++}
++
+ #define M1_PMU_EVENT_ATTR(name, config)					\
+ 	PMU_EVENT_ATTR_ID(name, m1_pmu_events_sysfs_show, config)
+ 
++#define M3_PMU_EVENT_ATTR(name, config)					\
++	PMU_EVENT_ATTR_ID(name, m3_pmu_events_sysfs_show, config)
++
+ static struct attribute *m1_pmu_event_attrs[] = {
+ 	M1_PMU_EVENT_ATTR(cycles, M1_PMU_PERFCTR_CORE_ACTIVE_CYCLE),
+ 	M1_PMU_EVENT_ATTR(instructions, M1_PMU_PERFCTR_INST_ALL),
+ 	NULL,
+ };
+ 
++static struct attribute *m3_pmu_event_attrs[] = {
++	M3_PMU_EVENT_ATTR(cycles, M3_PMU_PERFCTR_CORE_ACTIVE_CYCLE),
++	M3_PMU_EVENT_ATTR(instructions, M3_PMU_PERFCTR_INST_ALL),
++	NULL,
++};
++
++static struct attribute *m4_pmu_event_attrs[] = {
++	M3_PMU_EVENT_ATTR(cycles, M4_PMU_PERFCTR_CORE_ACTIVE_CYCLE),
++	M3_PMU_EVENT_ATTR(instructions, M4_PMU_PERFCTR_INST_ALL),
++	NULL,
++};
++
+ static const struct attribute_group m1_pmu_events_attr_group = {
+ 	.name = "events",
+ 	.attrs = m1_pmu_event_attrs,
+ };
+ 
+-PMU_FORMAT_ATTR(event, "config:0-7");
++static const struct attribute_group m3_pmu_events_attr_group = {
++	.name = "events",
++	.attrs = m3_pmu_event_attrs,
++};
++
++static const struct attribute_group m4_pmu_events_attr_group = {
++	.name = "events",
++	.attrs = m4_pmu_event_attrs,
++};
++
++PMU_FORMAT_ATTR_SHOW(event_8b, "config:0-7");
++PMU_FORMAT_ATTR_SHOW(event_16b, "config:0-15");
++
++/* Both are named "event", which is what perf and the events/ aliases use. */
++static struct device_attribute format_attr_event_8b =
++	__ATTR(event, 0444, event_8b_show, NULL);
++static struct device_attribute format_attr_event_16b =
++	__ATTR(event, 0444, event_16b_show, NULL);
++
++static struct attribute *apple_pmu_format_attrs_8[] = {
++	&format_attr_event_8b.attr,
++	NULL,
++};
+ 
+-static struct attribute *m1_pmu_format_attrs[] = {
+-	&format_attr_event.attr,
++static struct attribute *apple_pmu_format_attrs_16[] = {
++	&format_attr_event_16b.attr,
+ 	NULL,
+ };
+ 
+ static const struct attribute_group m1_pmu_format_attr_group = {
+ 	.name = "format",
+-	.attrs = m1_pmu_format_attrs,
++	.attrs = apple_pmu_format_attrs_8,
++};
++
++static const struct attribute_group m3_pmu_format_attr_group = {
++	.name = "format",
++	.attrs = apple_pmu_format_attrs_16,
+ };
+ 
+ /* Low level accessors. No synchronisation. */
+@@ -376,7 +726,8 @@ static void __m1_pmu_configure_event_filter(unsigned int index, bool user,
+ 		sysreg_clear_set_s(SYS_IMP_APL_PMCR1_EL12, clear, set);
+ }
+ 
+-static void __m1_pmu_configure_eventsel(unsigned int index, u8 event)
++static void __apple_pmu_configure_eventsel(unsigned int index, u16 event,
++					   unsigned int size, u64 mask)
+ {
+ 	u64 clear = 0, set = 0;
+ 	int shift;
+@@ -391,14 +742,14 @@ static void __m1_pmu_configure_eventsel(unsigned int index, u8 event)
+ 	case 0 ... 1:
+ 		break;
+ 	case 2 ... 5:
+-		shift = (index - 2) * 8;
+-		clear |= (u64)0xff << shift;
++		shift = (index - 2) * size;
++		clear |= mask << shift;
+ 		set |= (u64)event << shift;
+ 		sysreg_clear_set_s(SYS_IMP_APL_PMESR0_EL1, clear, set);
+ 		break;
+ 	case 6 ... 9:
+-		shift = (index - 6) * 8;
+-		clear |= (u64)0xff << shift;
++		shift = (index - 6) * size;
++		clear |= mask << shift;
+ 		set |= (u64)event << shift;
+ 		sysreg_clear_set_s(SYS_IMP_APL_PMESR1_EL1, clear, set);
+ 		break;
+@@ -415,25 +766,39 @@ static void m1_pmu_configure_counter(unsigned int index, unsigned long config_ba
+ 
+ 	__m1_pmu_configure_event_filter(index, user && host, kernel && host, true);
+ 	__m1_pmu_configure_event_filter(index, user && guest, kernel && guest, false);
+-	__m1_pmu_configure_eventsel(index, evt);
++	__apple_pmu_configure_eventsel(index, evt, 8, M1_PMU_CFG_EVENT);
+ }
+ 
+-/* arm_pmu backend */
+-static void m1_pmu_enable_event(struct perf_event *event)
++static void m3_pmu_configure_counter(unsigned int index, unsigned long config_base)
+ {
+-	bool user, kernel;
+-	u8 evt;
++	bool kernel = config_base & M3_PMU_CFG_COUNT_KERNEL;
++	bool guest = config_base & M3_PMU_CFG_COUNT_GUEST;
++	bool host = config_base & M3_PMU_CFG_COUNT_HOST;
++	bool user = config_base & M3_PMU_CFG_COUNT_USER;
++	u16 evt = config_base & M3_PMU_CFG_EVENT;
+ 
+-	evt = event->hw.config_base & M1_PMU_CFG_EVENT;
+-	user = event->hw.config_base & M1_PMU_CFG_COUNT_USER;
+-	kernel = event->hw.config_base & M1_PMU_CFG_COUNT_KERNEL;
++	__m1_pmu_configure_event_filter(index, user && host, kernel && host, true);
++	__m1_pmu_configure_event_filter(index, user && guest, kernel && guest, false);
++	__apple_pmu_configure_eventsel(index, evt, 16, M3_PMU_CFG_EVENT);
++}
+ 
++/* arm_pmu backend */
++static void m1_pmu_enable_event(struct perf_event *event)
++{
+ 	m1_pmu_configure_counter(event->hw.idx, event->hw.config_base);
+ 	m1_pmu_enable_counter(event->hw.idx);
+ 	m1_pmu_enable_counter_interrupt(event->hw.idx);
+ 	isb();
+ }
+ 
++static void m3_pmu_enable_event(struct perf_event *event)
++{
++	m3_pmu_configure_counter(event->hw.idx, event->hw.config_base);
++	m1_pmu_enable_counter(event->hw.idx);
++	m1_pmu_enable_counter_interrupt(event->hw.idx);
++	isb();
++}
++
+ static void m1_pmu_disable_event(struct perf_event *event)
+ {
+ 	m1_pmu_disable_counter_interrupt(event->hw.idx);
+@@ -493,11 +858,10 @@ static void m1_pmu_write_counter(struct perf_event *event, u64 value)
+ 	isb();
+ }
+ 
+-static int m1_pmu_get_event_idx(struct pmu_hw_events *cpuc,
+-				struct perf_event *event)
++static int apple_pmu_get_event_idx(struct pmu_hw_events *cpuc,
++				   struct perf_event *event,
++				   unsigned long affinity)
+ {
+-	unsigned long evtype = event->hw.config_base & M1_PMU_CFG_EVENT;
+-	unsigned long affinity = m1_pmu_event_affinity[evtype];
+ 	int idx;
+ 
+ 	/*
+@@ -516,6 +880,53 @@ static int m1_pmu_get_event_idx(struct pmu_hw_events *cpuc,
+ 	return -EAGAIN;
+ }
+ 
++static int apple_pmu_get_event_idx_8(struct pmu_hw_events *cpuc,
++				     struct perf_event *event,
++				     const u16 event_affinities[M1_PMU_CFG_EVENT + 1])
++{
++	unsigned long evtype = event->hw.config_base & M1_PMU_CFG_EVENT;
++	unsigned long affinity = event_affinities[evtype];
++
++	return apple_pmu_get_event_idx(cpuc, event, affinity);
++}
++
++static int apple_pmu_get_event_idx_16(struct pmu_hw_events *cpuc,
++				      struct perf_event *event,
++				      unsigned long event_affinities_size,
++				      const struct event_affinity_16 event_affinities[])
++{
++	unsigned long evtype = event->hw.config_base & M3_PMU_CFG_EVENT;
++	unsigned long affinity = ANY_BUT_0_1;
++
++	for (int idx = 0; idx < event_affinities_size; idx++) {
++		if (event_affinities[idx].event_code == evtype) {
++			affinity = event_affinities[idx].affinity;
++			break;
++		}
++	}
++	return apple_pmu_get_event_idx(cpuc, event, affinity);
++}
++
++static int m1_pmu_get_event_idx(struct pmu_hw_events *cpuc,
++				struct perf_event *event)
++{
++	return apple_pmu_get_event_idx_8(cpuc, event, m1_pmu_event_affinity);
++}
++
++static int m3_pmu_get_event_idx(struct pmu_hw_events *cpuc,
++				struct perf_event *event)
++{
++	return apple_pmu_get_event_idx_16(cpuc, event, ARRAY_SIZE(m3_pmu_event_affinity),
++					  m3_pmu_event_affinity);
++}
++
++static int m4_pmu_get_event_idx(struct pmu_hw_events *cpuc,
++				struct perf_event *event)
++{
++	return apple_pmu_get_event_idx_16(cpuc, event, ARRAY_SIZE(m4_pmu_event_affinity),
++					  m4_pmu_event_affinity);
++}
++
+ static void m1_pmu_clear_event_idx(struct pmu_hw_events *cpuc,
+ 				   struct perf_event *event)
+ {
+@@ -543,44 +954,76 @@ static void m1_pmu_stop(struct arm_pmu *cpu_pmu)
+ 	__m1_pmu_set_mode(PMCR0_IMODE_OFF);
+ }
+ 
++static int apple_pmu_map_event(struct perf_event *event,
++			       const unsigned int (*perf_map)[],
++			       unsigned int flags, u32 mask)
++{
++	event->hw.flags |= flags;
++	return armpmu_map_event(event, perf_map, NULL, mask);
++}
++
++/*
++ * Apple PMU counters have been observed to be either 48 or
++ * 64 bits wide, depending on the SoC. However, the MSB is
++ * what triggers an overflow interrupt, so we advertise the
++ * counters as being 1-bit smaller than hardware allows to
++ * mimic ARM PMU behaviour.
++ */
+ static int m1_pmu_map_event(struct perf_event *event)
+ {
+-	/*
+-	 * Although the counters are 48bit wide, bit 47 is what
+-	 * triggers the overflow interrupt. Advertise the counters
+-	 * being 47bit wide to mimick the behaviour of the ARM PMU.
+-	 */
+-	event->hw.flags |= ARMPMU_EVT_47BIT;
+-	return armpmu_map_event(event, &m1_pmu_perf_map, NULL, M1_PMU_CFG_EVENT);
++	return apple_pmu_map_event(event, &m1_pmu_perf_map, ARMPMU_EVT_47BIT,
++				   M1_PMU_CFG_EVENT);
+ }
+ 
+ static int m2_pmu_map_event(struct perf_event *event)
+ {
+-	/*
+-	 * Same deal as the above, except that M2 has 64bit counters.
+-	 * Which, as far as we're concerned, actually means 63 bits.
+-	 * Yes, this is getting awkward.
+-	 */
+-	event->hw.flags |= ARMPMU_EVT_63BIT;
+-	return armpmu_map_event(event, &m1_pmu_perf_map, NULL, M1_PMU_CFG_EVENT);
++	return apple_pmu_map_event(event, &m1_pmu_perf_map, ARMPMU_EVT_63BIT,
++				   M1_PMU_CFG_EVENT);
+ }
+ 
+-static int m1_pmu_map_pmuv3_event(unsigned int eventsel)
++static int m3_pmu_map_event(struct perf_event *event)
++{
++	return apple_pmu_map_event(event, &m3_pmu_perf_map, ARMPMU_EVT_63BIT,
++				   M3_PMU_CFG_EVENT);
++}
++
++static int m4_pmu_map_event(struct perf_event *event)
+ {
+-	u16 m1_event = HW_OP_UNSUPPORTED;
++	return apple_pmu_map_event(event, &m4_pmu_perf_map, ARMPMU_EVT_63BIT,
++				   M3_PMU_CFG_EVENT);
++}
++
++static int apple_pmu_map_pmuv3_event(unsigned int eventsel, const u16 pmceid_map[])
++{
++	u16 apple_event = HW_OP_UNSUPPORTED;
+ 
+ 	if (eventsel < ARMV8_PMUV3_MAX_COMMON_EVENTS)
+-		m1_event = m1_pmu_pmceid_map[eventsel];
++		apple_event = pmceid_map[eventsel];
+ 
+-	return m1_event == HW_OP_UNSUPPORTED ? -EOPNOTSUPP : m1_event;
++	return apple_event == HW_OP_UNSUPPORTED ? -EOPNOTSUPP : apple_event;
+ }
+ 
+-static void m1_pmu_init_pmceid(struct arm_pmu *pmu)
++static int m1_pmu_map_pmuv3_event(unsigned int eventsel)
++{
++	return apple_pmu_map_pmuv3_event(eventsel, m1_pmu_pmceid_map);
++}
++
++static int m3_pmu_map_pmuv3_event(unsigned int eventsel)
++{
++	return apple_pmu_map_pmuv3_event(eventsel, m3_pmu_pmceid_map);
++}
++
++static int m4_pmu_map_pmuv3_event(unsigned int eventsel)
++{
++	return apple_pmu_map_pmuv3_event(eventsel, m4_pmu_pmceid_map);
++}
++
++static void apple_pmu_init_pmceid(struct arm_pmu *pmu)
+ {
+ 	unsigned int event;
+ 
+ 	for (event = 0; event < ARMV8_PMUV3_MAX_COMMON_EVENTS; event++) {
+-		if (m1_pmu_map_pmuv3_event(event) >= 0)
++		if (pmu->map_pmuv3_event(event) >= 0)
+ 			set_bit(event, pmu->pmceid_bitmap);
+ 	}
+ }
+@@ -623,67 +1066,108 @@ static int m1_pmu_set_event_filter(struct hw_perf_event *event,
+ 	return 0;
+ }
+ 
+-static int m1_pmu_init(struct arm_pmu *cpu_pmu, u32 flags)
++static int m3_pmu_set_event_filter(struct hw_perf_event *event,
++				   struct perf_event_attr *attr)
++{
++	unsigned long config_base = 0;
++
++	if (!attr->exclude_guest && !is_kernel_in_hyp_mode()) {
++		pr_debug("ARM performance counters do not support mode exclusion\n");
++		return -EOPNOTSUPP;
++	}
++	if (!attr->exclude_kernel)
++		config_base |= M3_PMU_CFG_COUNT_KERNEL;
++	if (!attr->exclude_user)
++		config_base |= M3_PMU_CFG_COUNT_USER;
++	if (!attr->exclude_host)
++		config_base |= M3_PMU_CFG_COUNT_HOST;
++	if (!attr->exclude_guest)
++		config_base |= M3_PMU_CFG_COUNT_GUEST;
++
++	event->config_base = config_base;
++
++	return 0;
++}
++
++static int apple_pmu_init(struct arm_pmu *cpu_pmu)
+ {
+ 	cpu_pmu->handle_irq	  = m1_pmu_handle_irq;
+-	cpu_pmu->enable		  = m1_pmu_enable_event;
+ 	cpu_pmu->disable	  = m1_pmu_disable_event;
+ 	cpu_pmu->read_counter	  = m1_pmu_read_counter;
+ 	cpu_pmu->write_counter	  = m1_pmu_write_counter;
+-	cpu_pmu->get_event_idx	  = m1_pmu_get_event_idx;
+ 	cpu_pmu->clear_event_idx  = m1_pmu_clear_event_idx;
+ 	cpu_pmu->start		  = m1_pmu_start;
+ 	cpu_pmu->stop		  = m1_pmu_stop;
+-
+-	if (flags & ARMPMU_EVT_47BIT)
+-		cpu_pmu->map_event = m1_pmu_map_event;
+-	else if (flags & ARMPMU_EVT_63BIT)
+-		cpu_pmu->map_event = m2_pmu_map_event;
+-	else
+-		return WARN_ON(-EINVAL);
+-
+ 	cpu_pmu->reset		  = m1_pmu_reset;
+-	cpu_pmu->set_event_filter = m1_pmu_set_event_filter;
+ 
+-	cpu_pmu->map_pmuv3_event  = m1_pmu_map_pmuv3_event;
+-	m1_pmu_init_pmceid(cpu_pmu);
++	apple_pmu_init_pmceid(cpu_pmu);
+ 
+ 	bitmap_set(cpu_pmu->cntr_mask, 0, M1_PMU_NR_COUNTERS);
+-	cpu_pmu->attr_groups[ARMPMU_ATTR_GROUP_EVENTS] = &m1_pmu_events_attr_group;
+-	cpu_pmu->attr_groups[ARMPMU_ATTR_GROUP_FORMATS] = &m1_pmu_format_attr_group;
+ 	return 0;
+ }
+ 
+ /* Device driver gunk */
+-static int m1_pmu_ice_init(struct arm_pmu *cpu_pmu)
+-{
+-	cpu_pmu->name = "apple_icestorm_pmu";
+-	return m1_pmu_init(cpu_pmu, ARMPMU_EVT_47BIT);
++#define APPLE_PMU_INIT(gen, family)								\
++static int gen ## _pmu_ ## family ## _init(struct arm_pmu *cpu_pmu)				\
++{												\
++	cpu_pmu->name			= "apple_" #family "_pmu";				\
++	cpu_pmu->enable			= gen ## _pmu_enable_event;				\
++	cpu_pmu->get_event_idx		= gen ## _pmu_get_event_idx;				\
++	cpu_pmu->map_event		= gen ## _pmu_map_event;				\
++	cpu_pmu->set_event_filter	= gen ## _pmu_set_event_filter;				\
++												\
++	cpu_pmu->map_pmuv3_event	= gen ## _pmu_map_pmuv3_event;				\
++												\
++	cpu_pmu->attr_groups[ARMPMU_ATTR_GROUP_EVENTS] = &gen ## _pmu_events_attr_group;	\
++	cpu_pmu->attr_groups[ARMPMU_ATTR_GROUP_FORMATS] = &gen ## _pmu_format_attr_group;	\
++	return apple_pmu_init(cpu_pmu);								\
+ }
+ 
+-static int m1_pmu_fire_init(struct arm_pmu *cpu_pmu)
+-{
+-	cpu_pmu->name = "apple_firestorm_pmu";
+-	return m1_pmu_init(cpu_pmu, ARMPMU_EVT_47BIT);
+-}
+-
+-static int m2_pmu_avalanche_init(struct arm_pmu *cpu_pmu)
+-{
+-	cpu_pmu->name = "apple_avalanche_pmu";
+-	return m1_pmu_init(cpu_pmu, ARMPMU_EVT_63BIT);
+-}
+-
+-static int m2_pmu_blizzard_init(struct arm_pmu *cpu_pmu)
+-{
+-	cpu_pmu->name = "apple_blizzard_pmu";
+-	return m1_pmu_init(cpu_pmu, ARMPMU_EVT_63BIT);
+-}
++#define m2_pmu_enable_event		m1_pmu_enable_event
++#define m2_pmu_get_event_idx		m1_pmu_get_event_idx
++#define m2_pmu_set_event_filter		m1_pmu_set_event_filter
++#define m2_pmu_map_pmuv3_event		m1_pmu_map_pmuv3_event
++#define m2_pmu_events_attr_group	m1_pmu_events_attr_group
++#define m2_pmu_format_attr_group	m1_pmu_format_attr_group
++
++#define m4_pmu_enable_event		m3_pmu_enable_event
++#define m4_pmu_set_event_filter		m3_pmu_set_event_filter
++#define m4_pmu_format_attr_group	m3_pmu_format_attr_group
++
++#define a18_pmu_enable_event		m4_pmu_enable_event
++#define a18_pmu_map_event		m4_pmu_map_event
++#define a18_pmu_get_event_idx		m4_pmu_get_event_idx
++#define a18_pmu_set_event_filter	m4_pmu_set_event_filter
++#define a18_pmu_map_pmuv3_event		m4_pmu_map_pmuv3_event
++#define a18_pmu_events_attr_group	m4_pmu_events_attr_group
++#define a18_pmu_format_attr_group	m4_pmu_format_attr_group
++
++APPLE_PMU_INIT(m1, icestorm)
++APPLE_PMU_INIT(m1, firestorm)
++APPLE_PMU_INIT(m2, avalanche)
++APPLE_PMU_INIT(m2, blizzard)
++APPLE_PMU_INIT(m3, sawtooth)
++APPLE_PMU_INIT(m3, everest)
++APPLE_PMU_INIT(a18, tahiti_e)
++APPLE_PMU_INIT(a18, tahiti_p)
++APPLE_PMU_INIT(m4, donan_e)
++APPLE_PMU_INIT(m4, donan_p)
++APPLE_PMU_INIT(m4, brava_e)
++APPLE_PMU_INIT(m4, brava_p)
+ 
+ static const struct of_device_id m1_pmu_of_device_ids[] = {
++	{ .compatible = "apple,brava-e-pmu",	.data = m4_pmu_brava_e_init, },
++	{ .compatible = "apple,brava-p-pmu",	.data = m4_pmu_brava_p_init, },
++	{ .compatible = "apple,donan-e-pmu",	.data = m4_pmu_donan_e_init, },
++	{ .compatible = "apple,donan-p-pmu",	.data = m4_pmu_donan_p_init, },
++	{ .compatible = "apple,tahiti-e-pmu",	.data = a18_pmu_tahiti_e_init, },
++	{ .compatible = "apple,tahiti-p-pmu",	.data = a18_pmu_tahiti_p_init, },
++	{ .compatible = "apple,sawtooth-pmu",	.data = m3_pmu_sawtooth_init, },
++	{ .compatible = "apple,everest-pmu",	.data = m3_pmu_everest_init, },
+ 	{ .compatible = "apple,avalanche-pmu",	.data = m2_pmu_avalanche_init, },
+ 	{ .compatible = "apple,blizzard-pmu",	.data = m2_pmu_blizzard_init, },
+-	{ .compatible = "apple,icestorm-pmu",	.data = m1_pmu_ice_init, },
+-	{ .compatible = "apple,firestorm-pmu",	.data = m1_pmu_fire_init, },
++	{ .compatible = "apple,icestorm-pmu",	.data = m1_pmu_icestorm_init, },
++	{ .compatible = "apple,firestorm-pmu",	.data = m1_pmu_firestorm_init, },
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(of, m1_pmu_of_device_ids);
+diff --git a/drivers/pmdomain/apple/pmp-report.c b/drivers/pmdomain/apple/pmp-report.c
+index 2d4a82e..33d69bd 100644
+--- a/drivers/pmdomain/apple/pmp-report.c
++++ b/drivers/pmdomain/apple/pmp-report.c
+@@ -15,6 +15,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
++#include <linux/rcupdate.h>
+ #include <linux/unaligned.h>
+ #include <linux/workqueue.h>
+ #include <linux/jiffies.h>
+@@ -52,6 +53,8 @@ struct apple_pmp_report_offsets {
+ 	u32 tgt_write;
+ 	u32 actual;
+ 	u32 status;
++	u32 fast_die;
++	u32 fast_die_lanes;
+ 	bool finalize_after_ready;
+ 	bool has_event_config;
+ };
+@@ -70,6 +73,29 @@ struct apple_pmp_report {
+ 	u64 ack_mask;
+ };
+ 
++static struct apple_pmp_report __rcu *apple_pmp_fast_die_report;
++
++int apple_pmp_report_fast_die_effort(const struct device_node *np,
++				     unsigned int lane, u8 *effort)
++{
++	struct apple_pmp_report *rep;
++	int ret = 0;
++
++	rcu_read_lock();
++	rep = rcu_dereference(apple_pmp_fast_die_report);
++	if (!rep || rep->dev->of_node != np)
++		ret = -EPROBE_DEFER;
++	else if (lane >= rep->offsets->fast_die_lanes)
++		ret = -EINVAL;
++	else if (!(readq(rep->base + rep->offsets->status) & PMP_REPORT_READY))
++		ret = -EAGAIN;
++	else
++		*effort = readl(rep->base + rep->offsets->fast_die) >> (lane * 8);
++	rcu_read_unlock();
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_pmp_report_fast_die_effort);
++
+ static int apple_pmp_report_read_device_flags(struct apple_pmp_report *rep)
+ {
+ 	struct device *dev = rep->dev;
+@@ -350,6 +376,9 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
+ 		schedule_delayed_work(&rep->finalize_work, 0);
+ 	}
+ 
++	if (rep->offsets->fast_die)
++		rcu_assign_pointer(apple_pmp_fast_die_report, rep);
++
+ 	return 0;
+ }
+ 
+@@ -357,6 +386,10 @@ static void apple_pmp_report_remove(struct platform_device *pdev)
+ {
+ 	struct apple_pmp_report *rep = platform_get_drvdata(pdev);
+ 
++	if (rcu_access_pointer(apple_pmp_fast_die_report) == rep) {
++		RCU_INIT_POINTER(apple_pmp_fast_die_report, NULL);
++		synchronize_rcu();
++	}
+ 	if (rep->offsets->finalize_after_ready)
+ 		cancel_delayed_work_sync(&rep->finalize_work);
+ 	apple_pmp_cpu_vote_stop(rep->cpu_vote);
+@@ -429,6 +462,8 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8132 = {
+ 	.tgt_write = 0x10c40,
+ 	.actual = 0x1900,
+ 	.status = 0x10,
++	.fast_die = 0x1d10,
++	.fast_die_lanes = 2,
+ 	.finalize_after_ready = true,
+ 	.has_event_config = true,
+ };
+diff --git a/drivers/soc/apple/pmp.rs b/drivers/soc/apple/pmp.rs
+index 1fdd757..c600972 100644
+--- a/drivers/soc/apple/pmp.rs
++++ b/drivers/soc/apple/pmp.rs
+@@ -96,7 +96,61 @@ struct PmpState {
+     ioreg_advertisements: usize,
+ }
+ 
++// Native 26.6.2 register replies retained from J713 PMP traces.
++const T8132_IOREG_VALUES: &[(&CStr, u32)] = &[
++    (c"agx-monitor", 1),
++    (c"amcc-monitor", 1),
++    (c"ane0-monitor", 1),
++    (c"dcs-monitor", 1),
++    (c"disp-monitor", 1),
++    (c"dispext0-monitor", 1),
++    (c"dispext1-monitor", 1),
++    (c"eacc0-monitor", 1),
++    (c"isp-monitor", 1),
++    (c"pacc0-monitor", 1),
++    (c"soc-aon-monitor", 1),
++    (c"soc-ni0-monitor", 1),
++    (c"soc-ni1-monitor", 1),
++    (c"soc-ni2-monitor", 1),
++    (c"soc-ni3-monitor", 1),
++    (c"soc-ni4-monitor", 1),
++    (c"soc-ni5-monitor", 1),
++    (c"soc-rest-monitor", 1),
++    (c"eacc0-push-thr", 0),
++    (c"soc-ni0-push-thr", 0x6f5),
++    (c"soc-ni1-push-thr", 0x6f5),
++    (c"soc-ni2-push-thr", 0x6f5),
++    (c"soc-ni3-push-thr", 0x6f5),
++    (c"soc-ni4-push-thr", 0x6f5),
++    (c"soc-ni5-push-thr", 0x6f5),
++    (c"pmc-voter-ceil-override-mask", 0xffffffff),
++    (c"dvfs_constraint_disable", 0),
++    (c"agx-p0-min-dcs-state", 0),
++    (c"agx-p1-min-dcs-state", 0),
++    (c"agx-p2-min-dcs-state", 0),
++    (c"agx-p3-min-dcs-state", 0),
++    (c"agx-p4-min-dcs-state", 1),
++    (c"agx-p5-min-dcs-state", 2),
++    (c"agx-p6-min-dcs-state", 3),
++    (c"agx-p7-min-dcs-state", 3),
++    (c"agx-p8-min-dcs-state", 4),
++    (c"agx-p9-min-dcs-state", 5),
++    (c"agx-p10-min-dcs-state", 5),
++    (c"agx-p0-min-soc-state", 0),
++    (c"agx-p1-min-soc-state", 0),
++    (c"agx-p2-min-soc-state", 0),
++    (c"agx-p3-min-soc-state", 0),
++    (c"agx-p4-min-soc-state", 0),
++    (c"agx-p5-min-soc-state", 1),
++    (c"agx-p6-min-soc-state", 1),
++    (c"agx-p7-min-soc-state", 1),
++    (c"agx-p8-min-soc-state", 2),
++    (c"agx-p9-min-soc-state", 2),
++    (c"agx-p10-min-soc-state", 2),
++];
++
+ struct PmpHwConfig {
++    t8132_ioreg_defaults: bool,
+     advertise_reply_index: bool,
+     pmc_bootstrap: bool,
+     shared_request_handles: bool,
+@@ -104,6 +158,7 @@ struct PmpHwConfig {
+ }
+ 
+ const PMP_HW_T6000: PmpHwConfig = PmpHwConfig {
++    t8132_ioreg_defaults: false,
+     advertise_reply_index: true,
+     pmc_bootstrap: false,
+     shared_request_handles: false,
+@@ -111,6 +166,7 @@ const PMP_HW_T6000: PmpHwConfig = PmpHwConfig {
+ };
+ 
+ const PMP_HW_T8132: PmpHwConfig = PmpHwConfig {
++    t8132_ioreg_defaults: true,
+     advertise_reply_index: false,
+     pmc_bootstrap: false,
+     shared_request_handles: false,
+@@ -118,6 +174,7 @@ const PMP_HW_T8132: PmpHwConfig = PmpHwConfig {
+ };
+ 
+ const PMP_HW_T8142: PmpHwConfig = PmpHwConfig {
++    t8132_ioreg_defaults: false,
+     advertise_reply_index: false,
+     pmc_bootstrap: true,
+     shared_request_handles: true,
+@@ -381,13 +438,16 @@ impl PmpData {
+                 size
+             );
+         }
+-        if self.hw.display_monitor_defaults && display_monitor
+-            && size == mem::size_of::<u32>() as u32 {
+-            /* The monitor descriptors carry their initial value through the
+-             * shared value buffer.  Native T8132 publishes all four display
+-             * monitor properties as one; a zero-filled host buffer silently
+-             * disables that PMP policy even though the descriptor is
+-             * acknowledged with the correct size. */
++        let initial = if self.hw.t8132_ioreg_defaults {
++            T8132_IOREG_VALUES.iter().find(|(key, _)| *key == name_str).map(|(_, value)| *value)
++        } else if self.hw.display_monitor_defaults && display_monitor {
++            Some(1)
++        } else {
++            None
++        };
++        if let (4, Some(value)) = (size, initial) {
++            // Initial register replies travel through the shared value
++            // buffer. Leaving a monitor at zero silently disables its policy.
+             let val_buf_addr = state.value_buf.ok_or(EIO)?;
+             let val_buf = state.get_buf(val_buf_addr).ok_or(EIO)?;
+             if val_buf.size() < mem::size_of::<u32>() {
+@@ -395,10 +455,10 @@ impl PmpData {
+             }
+             unsafe {
+                 val_buf.as_mut()[..mem::size_of::<u32>()]
+-                    .copy_from_slice(&1u32.to_le_bytes());
++                    .copy_from_slice(&value.to_le_bytes());
+             }
+             if verbose() {
+-                dev_info!(self.dev, "initialized PMP monitor {:?} to 1", name_str);
++                dev_info!(self.dev, "initialized PMP register {:?} to {:#x}", name_str, value);
+             }
+         } else if size == 0 {
+             let name_str = CString::try_from_fmt(fmt!("apple,tunable-{name_str}"))?;
+diff --git a/include/linux/soc/apple/pmp-report.h b/include/linux/soc/apple/pmp-report.h
+index 6e33496..b2b98b2 100644
+--- a/include/linux/soc/apple/pmp-report.h
++++ b/include/linux/soc/apple/pmp-report.h
+@@ -2,9 +2,20 @@
+ #ifndef _LINUX_SOC_APPLE_PMP_REPORT_H
+ #define _LINUX_SOC_APPLE_PMP_REPORT_H
+ #include <linux/types.h>
++#include <linux/errno.h>
+ 
+ struct device;
+ struct device_node;
++#if IS_ENABLED(CONFIG_APPLE_PMP_REPORT)
++int apple_pmp_report_fast_die_effort(const struct device_node *np,
++				     unsigned int lane, u8 *effort);
++#else
++static inline int apple_pmp_report_fast_die_effort(const struct device_node *np,
++						   unsigned int lane, u8 *effort)
++{
++	return -ENODEV;
++}
++#endif
+ int apple_pmp_report_snapshot(struct device *dev, u64 *target, u64 *actual, u64 *status);
+ 
+ 
+diff --git a/kernel/workqueue.c b/kernel/workqueue.c
+index c1cb328..4aef6c5 100644
+--- a/kernel/workqueue.c
++++ b/kernel/workqueue.c
+@@ -4822,6 +4822,7 @@ void free_workqueue_attrs(struct workqueue_attrs *attrs)
+ 		kfree(attrs);
+ 	}
+ }
++EXPORT_SYMBOL_GPL(free_workqueue_attrs);
+ 
+ /**
+  * alloc_workqueue_attrs - allocate a workqueue_attrs
+@@ -4850,6 +4851,7 @@ fail:
+ 	free_workqueue_attrs(attrs);
+ 	return NULL;
+ }
++EXPORT_SYMBOL_GPL(alloc_workqueue_attrs_noprof);
+ 
+ static void copy_workqueue_attrs(struct workqueue_attrs *to,
+ 				 const struct workqueue_attrs *from)
+@@ -5618,6 +5620,7 @@ int apply_workqueue_attrs(struct workqueue_struct *wq,
+ 
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(apply_workqueue_attrs);
+ 
+ /**
+  * unbound_wq_update_pwq - update a pwq slot for CPU hot[un]plug
