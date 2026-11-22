@@ -6,7 +6,7 @@
   buildPackages,
   # Needs /var/cache/ccache in nix.settings.extra-sandbox-paths.
   useCcache ? false,
-  extraKernelPatches ? [ ],
+  kernelPatches ? [ ],
   randstructSeed ? "",
   features ? { },
 }:
@@ -32,7 +32,7 @@
       inherit name;
       patch = ./patches + "/${name}";
     }) (lib.attrNames (builtins.readDir ./patches))
-    ++ extraKernelPatches;
+    ++ kernelPatches;
 
   allowImportFromDerivation = true;
 
@@ -54,7 +54,9 @@
       buildFlags = map (flag: if flag == "Image" then "Image.gz" else flag) old.buildFlags;
       # Keep modules_install and dtbs_install from nixpkgs; only switch the
       # image install target to match the compressed Image.gz build.
-      installTargets = map (target: if target == "install" then "zinstall" else target) old.installTargets;
+      installTargets = map (
+        target: if target == "install" then "zinstall" else target
+      ) old.installTargets;
     }
     // lib.optionalAttrs useCcache {
       # Structured attributes export only env.
