@@ -2,15 +2,15 @@
   config,
   lib,
   pkgs,
-  m1n1xPackages,
   ...
 }:
 let
+  # Kept out of import-tree's flake-parts scan; imported by the exported module.
   cfg = config.hardware.m1n1x;
-  kernel = m1n1xPackages.linuxKernel;
-  graviton = m1n1xPackages.graviton;
-  m1n1xBoot = m1n1xPackages.m1n1xBoot;
-  m1n1xReport = m1n1xPackages.m1n1xReport;
+  kernel = cfg.packages.linuxKernel;
+  graviton = cfg.packages.graviton;
+  m1n1xBoot = cfg.packages.m1n1xBoot;
+  m1n1xReport = cfg.packages.m1n1xReport;
   espTidy = pkgs.writeShellScript "m1n1x-esp-tidy" ''
     set -eu
     PATH=${lib.makeBinPath [ pkgs.coreutils ]}
@@ -58,6 +58,33 @@ in
       description = "ISO 3166 country code for Wi-Fi regulatory rules.";
     };
 
+    packages = {
+      graviton = lib.mkOption {
+        type = lib.types.package;
+        description = "Graviton bootloader package.";
+      };
+
+      linuxKernel = lib.mkOption {
+        type = lib.types.package;
+        description = "m1n1x Linux kernel package.";
+      };
+
+      mesa = lib.mkOption {
+        type = lib.types.package;
+        description = "Mesa build with the M4 Asahi GPU drivers.";
+      };
+
+      m1n1xBoot = lib.mkOption {
+        type = lib.types.package;
+        description = "m1n1x boot payload utility.";
+      };
+
+      m1n1xReport = lib.mkOption {
+        type = lib.types.package;
+        description = "m1n1x system report utility.";
+      };
+    };
+
     image = {
       rootUuid = lib.mkOption {
         type = lib.types.strMatching "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -70,12 +97,6 @@ in
         default = "m1n1x";
         description = "Filesystem label used by the root image.";
       };
-    };
-
-    mesa = lib.mkOption {
-      type = lib.types.package;
-      default = m1n1xPackages.mesa;
-      description = "Mesa build with the M4 Asahi GPU drivers.";
     };
   };
 
@@ -142,7 +163,7 @@ in
       options cfg80211 ieee80211_regdom="${cfg.wifiRegion}"
     '';
 
-    hardware.graphics.package = lib.mkOverride 999 cfg.mesa;
+    hardware.graphics.package = lib.mkOverride 999 cfg.packages.mesa;
     boot.kernelModules = [ "apple_soc_cpufreq" ];
 
     services.udev.extraRules = lib.mkIf (cfg.board == "j713") ''
