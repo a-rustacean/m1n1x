@@ -1,0 +1,80 @@
+From: Dilshad <a-rustacean@outlook.com>
+Subject: [PATCH] Bluetooth: bcm4377: Load BCM4388 calibration from firmware
+
+The J773G installer collects the machine's Bluetooth beamforming calibration
+as brcm/brcmbt4388-<address>-bf.bin. The direct m1n1-to-Linux boot path does
+not inject that blob into the Bluetooth device-tree node, unlike the U-Boot
+path. Keep device-tree calibration preferred, but load the address-matched
+firmware file when BCM4388 has no calibration property.
+
+The firmware filename uses the address from /chosen, while m1n1 writes
+local-bd-address in reverse byte order.
+
+---
+diff --git a/drivers/bluetooth/hci_bcm4377.c b/drivers/bluetooth/hci_bcm4377.c
+--- a/drivers/bluetooth/hci_bcm4377.c
++++ b/drivers/bluetooth/hci_bcm4377.c
+@@ -2262,6 +2262,53 @@ static int bcm4377_probe_dmi(struct bcm4377_data *bcm4377)
+ 	return 0;
+ }
+ 
++static int bcm4377_load_beamforming_calibration(struct bcm4377_data *bcm4377,
++						struct device_node *np)
++{
++	const struct firmware *fw;
++	struct device *dev = &bcm4377->pdev->dev;
++	u8 address[6];
++	char fw_name[sizeof("brcm/brcmbt4388-000000000000-bf.bin")];
++	int ret;
++
++	ret = of_property_read_u8_array(np, "local-bd-address", address,
++					sizeof(address));
++	if (ret) {
++		dev_err(dev, "failed to read local-bd-address for calibration lookup\n");
++		return ret;
++	}
++
++	snprintf(fw_name, sizeof(fw_name),
++		 "brcm/brcmbt4388-%02x%02x%02x%02x%02x%02x-bf.bin",
++		 (unsigned int)address[5], (unsigned int)address[4],
++		 (unsigned int)address[3], (unsigned int)address[2],
++		 (unsigned int)address[1], (unsigned int)address[0]);
++
++	ret = request_firmware(&fw, fw_name, dev);
++	if (ret) {
++		dev_err(dev, "failed to load calibration firmware %s: %d\n",
++			fw_name, ret);
++		return ret;
++	}
++
++	if (!fw->size) {
++		dev_err(dev, "calibration firmware %s is empty\n", fw_name);
++		release_firmware(fw);
++		return -EINVAL;
++	}
++
++	bcm4377->taurus_beamforming_cal_blob =
++		devm_kmemdup(dev, fw->data, fw->size, GFP_KERNEL);
++	if (!bcm4377->taurus_beamforming_cal_blob) {
++		release_firmware(fw);
++		return -ENOMEM;
++	}
++	bcm4377->taurus_beamforming_cal_size = fw->size;
++	release_firmware(fw);
++
++	return 0;
++}
++
+ static int bcm4377_probe_of(struct bcm4377_data *bcm4377)
+ {
+ 	struct device_node *np = bcm4377->pdev->dev.of_node;
+@@ -2282,7 +2329,10 @@ static int bcm4377_probe_of(struct bcm4377_data *bcm4377)
+ 				&bcm4377->taurus_beamforming_cal_size);
+ 	if (bcm4377->hw->id == 0x4388) {
+ 		/* BCM4388 never uses the non-beamforming calibration. */
+-		return bcm4377->taurus_beamforming_cal_blob ? 0 : -ENOENT;
++		if (bcm4377->taurus_beamforming_cal_blob)
++			return 0;
++
++		return bcm4377_load_beamforming_calibration(bcm4377, np);
+ 	}
