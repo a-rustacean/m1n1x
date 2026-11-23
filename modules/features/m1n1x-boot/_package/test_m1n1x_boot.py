@@ -159,6 +159,48 @@ class Compose(unittest.TestCase):
         self.assertEqual(boot.parse(data)['dtb'], mini)
         self.assertEqual(boot.split_initramfs(boot.parse(data)['initramfs'])[1], FIRMWARE)
 
+    def test_mini_migrates_legacy_wifi_firmware_aliases(self):
+        mini = fdt(board=b'apple,j773g')
+        old_names = [
+            'brcm/brcmfmac4388c0-pcie.bin',
+            'brcm/brcmfmac4388c0-pcie.txt',
+            'brcm/brcmfmac4388c0-pcie.clm_blob',
+            'brcm/brcmfmac4388c0-pcie.txcap_blob',
+            'brcm/brcmfmac4388c0-pcie.sig',
+        ]
+        entries = [('vendorfw', 0o40755, b''),
+                   ('vendorfw/.vendorfw.manifest', 0o100644,
+                    ''.join(f'FILE {name} SHA256 test\n' for name in old_names).encode()),
+                   ('vendorfw/brcm', 0o40755, b'')]
+        entries.extend(
+            (f'vendorfw/{name}', 0o100644, f'firmware-{index}'.encode())
+            for index, name in enumerate(old_names)
+        )
+        legacy_firmware = cpio(entries)
+
+        data, _ = compose(
+            current=installed(dtb=mini, firmware=legacy_firmware),
+            dtb=mini,
+        )
+        migrated = boot.split_initramfs(boot.parse(data)['initramfs'])[1]
+        names = boot.cpio_names(migrated)
+
+        self.assertTrue(any('4388c2-pcie.bin' in name for name in names))
+        self.assertFalse(any('4388c0-pcie' in name for name in names))
+        self.assertIn(b'FILE brcm/brcmfmac4388c2-pcie.bin SHA256 test', migrated)
+        self.assertNotIn(b'brcmfmac4388c0-pcie', migrated)
+        self.assertEqual(compose(current=data, dtb=mini)[0], data)
+
+    def test_air_does_not_migrate_legacy_mini_firmware_aliases(self):
+        legacy_firmware = cpio([
+            ('vendorfw', 0o40755, b''),
+            ('vendorfw/.vendorfw.manifest', 0o100644, b'manifest\n'),
+            ('vendorfw/brcm/brcmfmac4388c0-pcie.bin', 0o100644, b'firmware'),
+        ])
+        data, _ = compose(current=installed(firmware=legacy_firmware))
+        preserved = boot.split_initramfs(boot.parse(data)['initramfs'])[1]
+        self.assertEqual(preserved, legacy_firmware)
+
     def test_cannot_switch_between_supported_boards(self):
         mini = fdt(board=b'apple,j773g')
         for current, new in ((DTB, mini), (mini, DTB)):

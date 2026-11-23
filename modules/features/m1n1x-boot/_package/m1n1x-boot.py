@@ -208,6 +208,59 @@ def cpio_names(data):
         names.append(name.lstrip('/'))
 
 
+def normalize_j773g_wifi_firmware(data, board):
+    """Rename pre-fix Mac mini firmware aliases to the C2 names the kernel asks for."""
+    if board != b'apple,j773g':
+        return data
+
+    names = cpio_names(data)
+    prefix = FIRMWARE_DIR + '/brcm/brcmfmac4388c0-pcie.'
+    renames = {
+        name: name.replace('brcmfmac4388c0-pcie.', 'brcmfmac4388c2-pcie.', 1)
+        for name in names
+        if name.startswith(prefix)
+    }
+    if not renames:
+        return data
+
+    present = set(names)
+    collisions = set(renames.values()) & present
+    require(not collisions, 'The firmware archive has both legacy and C2 J773G Wi-Fi aliases')
+
+    result = bytearray(data)
+    position = 0
+    while True:
+        fields = [
+            int(data[position + 6 + 8 * i:position + 14 + 8 * i], 16)
+            for i in range(13)
+        ]
+        filesize, namesize = fields[6], fields[11]
+        name_start = position + 110
+        name_end = name_start + namesize - 1
+        name = data[name_start:name_end].decode('utf-8', 'surrogateescape')
+        body = (name_start + namesize + 3) & ~3
+        next_position = (body + filesize + 3) & ~3
+
+        if name in renames:
+            replacement = renames[name].encode('utf-8')
+            require(len(replacement) == namesize - 1, 'Wi-Fi alias migration changed a CPIO name length')
+            result[name_start:name_end] = replacement
+        elif name == FIRMWARE_MANIFEST:
+            manifest = bytes(result[body:body + filesize])
+            for old, new in renames.items():
+                old_path = old[len(FIRMWARE_DIR) + 1:].encode('utf-8')
+                new_path = new[len(FIRMWARE_DIR) + 1:].encode('utf-8')
+                manifest = manifest.replace(old_path, new_path)
+            require(len(manifest) == filesize, 'Wi-Fi alias migration changed the firmware manifest size')
+            result[body:body + filesize] = manifest
+
+        if name == TRAILER:
+            break
+        position = next_position
+
+    return bytes(result)
+
+
 def check_firmware(firmware):
     names = cpio_names(firmware)
     require(FIRMWARE_MANIFEST in names, 'The firmware archive has no ' + FIRMWARE_MANIFEST)
@@ -233,6 +286,8 @@ def compose(current, loader, kernel, dtb, initrd, args, init):
     layout = parse(current)
     current_board = dtb_board(layout['dtb'])
     _, firmware = split_initramfs(layout['initramfs'])
+    names = check_firmware(firmware)
+    firmware = normalize_j773g_wifi_firmware(firmware, current_board)
     names = check_firmware(firmware)
     require(len(firmware) <= LIMITS['firmware'], 'The firmware archive is too large')
 

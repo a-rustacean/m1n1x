@@ -1,0 +1,64 @@
+From 2ad2b7f0d1c2519a7e56984efc611b224e9e6671 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] gravity_firmware: use 4388C2 aliases for the M4 mini
+
+The J773G's Broadcom PCIe radio reports revision 6, which m1n1x's brcmfmac
+maps to 4388C2. The C2 firmware files must therefore use the C2 Linux names;
+the old C0 aliases left the driver unable to find any of its firmware.
+
+---
+ gravity_firmware/wifi.py  | 12 ++++++------
+ tests/test_m4_firmware.py | 10 +++++-----
+ 2 files changed, 11 insertions(+), 11 deletions(-)
+
+diff --git a/gravity_firmware/wifi.py b/gravity_firmware/wifi.py
+--- a/gravity_firmware/wifi.py
++++ b/gravity_firmware/wifi.py
+@@ -5,17 +5,17 @@
+ log = logging.getLogger("gravity_firmware.wifi")
+-
++
+-# Linux currently requests generic firmware names on the M4 Mac mini.  Keep
+-# these aliases explicit and machine-scoped: using a generic alias for the
+-# wrong board can load an incompatible NVRAM or transmit-power configuration.
++# The M4 mini's 4388C2 PCIe revision requests the C2 firmware names. Keep
++# these aliases explicit and machine-scoped: using an alias for the wrong
++# board can load an incompatible NVRAM or transmit-power configuration.
+ MACHINE_ALIASES = {
+     "j773g": {
+-        "brcm/brcmfmac4388c0-pcie.bin":
++        "brcm/brcmfmac4388c2-pcie.bin":
+             "C-4388__s-C2/sakhalin.trx",
+-        "brcm/brcmfmac4388c0-pcie.txt":
++        "brcm/brcmfmac4388c2-pcie.txt":
+             "C-4388__s-C2/P-sakhalin-X0_M-WLMT_V-u__m-4.9.txt",
+-        "brcm/brcmfmac4388c0-pcie.clm_blob":
++        "brcm/brcmfmac4388c2-pcie.clm_blob":
+             "C-4388__s-C2/sakhalin-X0.clmb",
+-        "brcm/brcmfmac4388c0-pcie.txcap_blob":
++        "brcm/brcmfmac4388c2-pcie.txcap_blob":
+             "C-4388__s-C2/sakhalin-X0.txcb",
+-        "brcm/brcmfmac4388c0-pcie.sig":
++        "brcm/brcmfmac4388c2-pcie.sig":
+             "C-4388__s-C2/sakhalin.sig",
+     },
+diff --git a/tests/test_m4_firmware.py b/tests/test_m4_firmware.py
+--- a/tests/test_m4_firmware.py
++++ b/tests/test_m4_firmware.py
+@@ -21,10 +21,10 @@
+-
++
+ M4_WIFI_OUTPUTS = {
+-    "brcm/brcmfmac4388c0-pcie.bin",
+-    "brcm/brcmfmac4388c0-pcie.txt",
+-    "brcm/brcmfmac4388c0-pcie.clm_blob",
+-    "brcm/brcmfmac4388c0-pcie.txcap_blob",
+-    "brcm/brcmfmac4388c0-pcie.sig",
++    "brcm/brcmfmac4388c2-pcie.bin",
++    "brcm/brcmfmac4388c2-pcie.txt",
++    "brcm/brcmfmac4388c2-pcie.clm_blob",
++    "brcm/brcmfmac4388c2-pcie.txcap_blob",
++    "brcm/brcmfmac4388c2-pcie.sig",
+ }
+-
++
+ M4_BT_SOURCES = {
