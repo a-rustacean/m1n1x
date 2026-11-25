@@ -17,9 +17,6 @@ let
     };
 in
 {
-  # The hardware module is reusable by host flakes. Its package options have
-  # defaults from this flake, but each can be overridden by the importing host.
-  flake.nixosModules.default = m1n1xModule;
   flake.nixosModules.m1n1x = m1n1xModule;
 
   perSystem =
@@ -56,12 +53,7 @@ in
     in
     {
       packages.m1n1x-kit = makeKit {
-        nixos = inputs.self.nixosConfigurations.j713;
-      };
-
-      packages.m1n1x-kit-j773g = makeKit {
-        nixos = inputs.self.nixosConfigurations.j773g;
-        suffix = "-j773g";
+        nixos = inputs.self.nixosConfigurations.m1n1x;
       };
     };
 }

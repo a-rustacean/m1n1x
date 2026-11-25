@@ -3,9 +3,10 @@
 For the 13-inch M4 MacBook Air (Mac16,12) or M4 Mac mini (Mac16,10). This guide takes you from a
 normal Mac to m1n1x (NixOS) beside macOS, and back again if you want.
 
-For the mini, build `m1n1x-kit-j773g` instead of `m1n1x-kit` below and use HDMI
-and a USB keyboard. Its integration is not yet boot-tested. Charger, lid and
-Air-specific thermal instructions apply only to the Air.
+This checkout builds the M4 Mac mini (J773G) host as `m1n1x-kit`; use HDMI and
+a USB keyboard. J713 hardware support remains in the module, but a J713 host
+configuration is no longer shipped. Charger, lid and Air-specific thermal
+instructions apply only to the Air.
 
 **Keep this guide on another device (phone or PC) while you install.** For
 part of the install the Mac is in recovery mode and cannot show it.
@@ -168,22 +169,25 @@ you can run the installer again or remove the partial install with R2.
 
 ## Part 5: first boot and checks
 
-Expect scrolling boot text, then the KDE Plasma login screen within a few
-minutes. Sign in as `m4` with the temporary password `change-me`. The first
-boot also grows m1n1x's filesystem to its partition.
+Expect scrolling boot text, then SDDM auto-logging in to Hyprland within a few
+minutes. The account is `dilshad` with the temporary password `change-me`. The
+first boot also grows m1n1x's filesystem to its partition.
 
 If it stops for more than 10 minutes: take a photo of the screen, force off,
 boot macOS, and use R1.
 
 ### Stage A: log in (read-only checks)
 
-User `m4`, password `change-me`. Then immediately:
+User `dilshad`, password `change-me`. Then immediately:
 
 ```sh
 passwd
 m1n1x-report > ~/report-1.txt
 less ~/report-1.txt
 ```
+
+On the desktop, Super+Enter opens kitty, Super+D opens fuzzel, and Super+Q
+closes the focused window.
 
 Check in the report:
 
@@ -205,8 +209,8 @@ nmcli --ask device wifi connect "Your network"
 ping -c3 nixos.org
 ```
 
-You can also connect from Plasma's network widget. If Wi-Fi is missing, keep
-`report-1.txt`; its firmware section shows why.
+The Hyprland desktop is intentionally minimal, so use `nmcli` to connect. If
+Wi-Fi is missing, keep `report-1.txt`; its firmware section shows why.
 
 ### Stage C: heat test (watch it)
 
@@ -231,10 +235,8 @@ stay well below that.
 
 ```sh
 cd ~/m1n1x
-# MacBook Air (J713):
-sudo nixos-rebuild boot --flake .#j713
-# Mac mini (J773G):
-sudo nixos-rebuild boot --flake .#j773g
+# Mac mini (J773G), the only host in this checkout:
+sudo nixos-rebuild boot --flake .#nixos
 ls -l /boot/efi/m1n1/
 sudo reboot
 ```

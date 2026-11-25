@@ -42,5 +42,6 @@ inputs.nixpkgs.lib.nixosSystem {
 ```
 
 This repository composes its own hosts under `modules/hosts/nixos/`; the
-shared Plasma profile is `nixosModules.m1n1xSystem`. The J713 and J773G
-installer kits are built separately as `m1n1x-kit` and `m1n1x-kit-j773g`.
+shared Hyprland profile is `nixosModules.m1n1xSystem`. The J773G installer kit
+is built as `m1n1x-kit`. J713 hardware remains supported by the
+`hardware.m1n1x` module, but this checkout no longer ships a J713 host.

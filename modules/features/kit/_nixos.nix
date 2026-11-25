@@ -41,8 +41,8 @@ in
         "j713"
         "j773g"
       ];
-      default = "j713";
-      description = "Target board: the 13-inch M4 MacBook Air or M4 Mac mini.";
+      default = "j773g";
+      description = "Target board: the M4 Mac mini (default) or 13-inch M4 MacBook Air.";
     };
 
     efiMountPoint = lib.mkOption {
